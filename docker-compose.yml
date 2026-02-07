@@ -59,6 +59,9 @@ services:
       LOG_CONFIG: /app/app/logging_config.json
       BRAVE_API_KEY: ${BRAVE_API_KEY}
       BRAVE_API_URL: ${BRAVE_API_URL:-https://api.search.brave.com/res/v1/web/search}
+      EXA_API_KEY: ${EXA_API_KEY}
+      EXA_API_URL: ${EXA_API_URL:-https://api.exa.ai/search}
+      SEARCH_SOURCE_ALLOWLIST: ${SEARCH_SOURCE_ALLOWLIST:-brave}
       SEARCH_CACHE_TTL_SECONDS: ${SEARCH_CACHE_TTL_SECONDS:-3600}
       SEARCH_MAX_RESULTS: ${SEARCH_MAX_RESULTS:-10}
       MINIO_ENDPOINT: ${MINIO_ENDPOINT:-minio:9000}
@@ -83,6 +86,9 @@ services:
       LOG_CONFIG: /app/app/logging_config.json
       BRAVE_API_KEY: ${BRAVE_API_KEY}
       BRAVE_API_URL: ${BRAVE_API_URL:-https://api.search.brave.com/res/v1/web/search}
+      EXA_API_KEY: ${EXA_API_KEY}
+      EXA_API_URL: ${EXA_API_URL:-https://api.exa.ai/search}
+      SEARCH_SOURCE_ALLOWLIST: ${SEARCH_SOURCE_ALLOWLIST:-brave}
       SEARCH_CACHE_TTL_SECONDS: ${SEARCH_CACHE_TTL_SECONDS:-3600}
       SEARCH_MAX_RESULTS: ${SEARCH_MAX_RESULTS:-10}
       MINIO_ENDPOINT: ${MINIO_ENDPOINT:-minio:9000}

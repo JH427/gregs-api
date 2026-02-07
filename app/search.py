@@ -3,7 +3,8 @@ import json
 import os
 import urllib.parse
 import urllib.request
-from datetime import datetime
+import urllib.error
+from datetime import datetime, timedelta
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import redis
@@ -19,6 +20,8 @@ from app.storage import get_client, get_object
 BRAVE_API_URL = os.getenv("BRAVE_API_URL", "https://api.search.brave.com/res/v1/web/search")
 BRAVE_API_KEY = os.getenv("BRAVE_API_KEY")
 SEARCH_MAX_RESULTS = int(os.getenv("SEARCH_MAX_RESULTS", "10"))
+EXA_API_URL = os.getenv("EXA_API_URL", "https://api.exa.ai/search")
+EXA_API_KEY = os.getenv("EXA_API_KEY")
 
 
 class SearchProvider:
@@ -54,6 +57,50 @@ class BraveSearchProvider(SearchProvider):
         with urllib.request.urlopen(req, timeout=15) as resp:
             body = resp.read().decode("utf-8")
         return json.loads(body)
+
+
+class ExaSearchProvider(SearchProvider):
+    name = "exa"
+
+    def search(self, query: str, recency_days: int) -> Dict[str, Any]:
+        if not EXA_API_KEY:
+            raise RuntimeError("EXA_API_KEY is not set")
+
+        # Exa Search API: POST https://api.exa.ai/search
+        # Auth: x-api-key header OR Authorization: Bearer <key>
+        payload: Dict[str, Any] = {
+            "query": query,
+            "numResults": SEARCH_MAX_RESULTS,
+            "contents": {"text": True},
+        }
+        if recency_days and recency_days > 0:
+            start_date = datetime.utcnow() - timedelta(days=recency_days)
+            payload["startPublishedDate"] = start_date.isoformat() + "Z"
+
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            EXA_API_URL,
+            data=data,
+            headers={
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "x-api-key": EXA_API_KEY,
+                "Authorization": f"Bearer {EXA_API_KEY}",
+                "User-Agent": "Narsil-Exa-Client/1.0",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                body = resp.read().decode("utf-8")
+            return json.loads(body)
+        except urllib.error.HTTPError as exc:
+            try:
+                error_body = exc.read().decode("utf-8")
+            except Exception:
+                error_body = ""
+            error_body = error_body[:500]
+            raise RuntimeError(f"exa_http_{exc.code}:{error_body}") from exc
 
 
 class TaskCancelled(Exception):
@@ -161,6 +208,7 @@ def run_search_task(
     cached_value = get_cache(redis_client, cache_key)
     if cached_value and "artifact_ids" in cached_value and "summary" in cached_value:
         log_event(logger, "search_cache_hit", task_id=task_id, cache_key=cache_key)
+        log_event(logger, "search_cached_hit", task_id=task_id, provider=",".join(sources))
         log_event(logger, "search_task_completed", task_id=task_id, cache_key=cache_key, cached=True)
         return cached_value
 
@@ -287,6 +335,7 @@ def run_search_batch_task(
         cached_payload = _load_cached_results(db, cached_value, logger) if cached_value else None
         if cached_payload:
             log_event(logger, "search_batch_cached_hit", task_id=task_id, cache_key=cache_key, query=query)
+            log_event(logger, "search_cached_hit", task_id=task_id, provider=",".join(sources), query=query)
             grouped_results.append(
                 {
                     "query": cached_payload.get("query", query),
@@ -392,13 +441,22 @@ def call_providers(
     for source in sources:
         if source == "brave":
             provider = BraveSearchProvider()
+        elif source == "exa":
+            provider = ExaSearchProvider()
         else:
             raise RuntimeError(f"unsupported search provider: {source}")
 
         log_event(logger, "search_provider_called", provider=provider.name, query=query)
-        raw = provider.search(query, recency_days)
+        try:
+            raw = provider.search(query, recency_days)
+        except Exception as exc:
+            log_event(logger, "search_provider_error", provider=provider.name, query=query, error=str(exc))
+            raise
         raw_payloads.append((provider.name, raw))
-        normalized = normalize_brave_results(raw)
+        if provider.name == "exa":
+            normalized = normalize_exa_results(raw)
+        else:
+            normalized = normalize_brave_results(raw)
         results.extend(normalized)
         sources_used.append(provider.name)
 
@@ -412,6 +470,12 @@ def normalize_brave_results(raw: Dict[str, Any]) -> List[Dict[str, Any]]:
         title = item.get("title")
         url = item.get("url") or item.get("link")
         snippet = item.get("description") or item.get("snippet")
+        published = (
+            item.get("published_at")
+            or item.get("published_time")
+            or item.get("published_date")
+            or item.get("date")
+        )
         if not title or not url:
             continue
         normalized.append(
@@ -419,7 +483,30 @@ def normalize_brave_results(raw: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "title": title,
                 "url": url,
                 "snippet": snippet or "",
+                "published_at": published,
                 "source": "brave",
+            }
+        )
+    return normalized
+
+
+def normalize_exa_results(raw: Dict[str, Any]) -> List[Dict[str, Any]]:
+    items = raw.get("results", [])
+    normalized: List[Dict[str, Any]] = []
+    for item in items:
+        title = item.get("title")
+        url = item.get("url")
+        snippet = item.get("summary") or item.get("text") or ""
+        published = item.get("publishedDate") or item.get("published_at") or item.get("published_date")
+        if not title or not url:
+            continue
+        normalized.append(
+            {
+                "title": title,
+                "url": url,
+                "snippet": snippet[:1000],
+                "published_at": published,
+                "source": "exa",
             }
         )
     return normalized

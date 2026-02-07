@@ -100,6 +100,14 @@ Response (202):
 
 Poll via `GET /tasks/{id}`. Normalized results are stored in an artifact with type `search_results`. Raw provider responses are stored as `search_raw` artifacts.
 
+Providers:
+- `brave` (default)
+- `exa` (requires `EXA_API_KEY` and allowlist entry)
+
+When to choose:
+- Use **exa** for high-signal research and cleaner results.
+- Use **brave** for broad recon and coverage.
+
 ### POST /search/batch
 Enqueues a batch search task (never synchronous). One task handles multiple queries.
 
@@ -127,6 +135,10 @@ Batch caching:
 - Each query uses the same cache key as single-search.
 - Overlapping batches reuse cached results.
 - Identical batches dedupe to prior artifacts.
+
+Exa notes:
+- If you request `exa` and the key is missing, the task is rejected deterministically.
+- `recency_days` is mapped to a published-date filter on Exa (best-effort).
 
 ## Artifacts
 ### GET /artifacts/{id}

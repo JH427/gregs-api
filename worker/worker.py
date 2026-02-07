@@ -33,6 +33,7 @@ from app.queue import (
     update_worker_heartbeat,
 )
 from app.search import (
+    EXA_API_KEY,
     TaskCancelled,
     TaskRuntimeExceeded,
     normalize_batch_params,
@@ -272,7 +273,28 @@ def execute_task(db: Session, task: Task) -> bool:
                 )
                 return False
             sources = (task.params_json.get("sources") or ["brave"])
-            if not isinstance(sources, list) or any(source.lower() not in SEARCH_SOURCE_ALLOWLIST for source in sources):
+            if not isinstance(sources, list):
+                log_event(
+                    logger,
+                    "task_rejected_invalid_params",
+                    task_id=task.id,
+                    reason="search_sources_invalid",
+                    allowlist=SEARCH_SOURCE_ALLOWLIST,
+                )
+                mark_failed(db, task, "task_rejected_invalid_params")
+                update_run_status(db, run, "failed")
+                return False
+            if "exa" in [source.lower() for source in sources] and not EXA_API_KEY:
+                log_event(
+                    logger,
+                    "task_rejected_invalid_params",
+                    task_id=task.id,
+                    reason="exa_api_key_missing",
+                )
+                mark_failed(db, task, "task_rejected_invalid_params")
+                update_run_status(db, run, "failed")
+                return False
+            if any(source.lower() not in SEARCH_SOURCE_ALLOWLIST for source in sources):
                 log_event(
                     logger,
                     "task_rejected_invalid_params",
@@ -334,6 +356,16 @@ def execute_task(db: Session, task: Task) -> bool:
                 return False
             sources = normalized["sources"]
             queries = normalized["queries"]
+            if "exa" in [source.lower() for source in sources] and not EXA_API_KEY:
+                log_event(
+                    logger,
+                    "task_rejected_invalid_params",
+                    task_id=task.id,
+                    reason="exa_api_key_missing",
+                )
+                mark_failed(db, task, "task_rejected_invalid_params")
+                update_run_status(db, run, "failed")
+                return False
             if len(queries) > MAX_BATCH_SIZE:
                 log_event(
                     logger,

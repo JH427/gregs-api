@@ -56,9 +56,11 @@ PostgreSQL:
 
 Search:
 - `BRAVE_API_KEY` (required for provider calls)
+- `EXA_API_KEY` (required for Exa provider)
 - `SEARCH_CACHE_TTL_SECONDS` (default `3600`)
 - `SEARCH_MAX_RESULTS` (default `10`)
 - `MAX_BATCH_SIZE` (default `50`)
+- `EXA_API_URL` (optional, default `https://api.exa.ai/search`)
 
 MinIO:
 - `MINIO_ROOT_USER`
@@ -138,6 +140,13 @@ Submit search task:
 docker compose exec -T api curl -s -X POST http://127.0.0.1:8000/search \
   -H 'Content-Type: application/json' \
   -d '{"query":"open source task runner","sources":["brave"],"recency_days":7}'
+```
+
+Submit Exa search task:
+```bash
+docker compose exec -T api curl -s -X POST http://127.0.0.1:8000/search \
+  -H 'Content-Type: application/json' \
+  -d '{"query":"agent memory systems","sources":["exa"],"recency_days":7}'
 ```
 
 Batch search results are stored in an artifact with type `search_batch_results` (grouped results per query).
@@ -222,3 +231,18 @@ Request:
 
 Result:
 - `GET /tasks/{id}` returns `result.artifact_ids` with the grouped `search_batch_results` artifact plus any per-query artifacts.
+
+## Phase 8A.1 — Exa Provider
+Exa is available as an additional provider when explicitly requested.
+
+Usage:
+- Include `"exa"` in `sources` and add `EXA_API_KEY` to the environment.
+- Keep `SEARCH_SOURCE_ALLOWLIST` updated (e.g. `brave,exa`) to allow Exa.
+
+Provider guidance:
+- **Exa** is best for high-signal research and cleaner results.
+- **Brave** is better for broad recon and coverage.
+
+Recency notes:
+- For Exa, `recency_days` is mapped to `startPublishedDate` (best-effort).
+- If `recency_days <= 0`, Exa does not apply a published-date filter.

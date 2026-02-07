@@ -24,7 +24,7 @@ from app.limits import (
 from app.models import Task
 from app.queue import enqueue_task, get_redis, WORKER_HEARTBEAT_KEY
 from app.storage import ensure_bucket, get_client
-from app.search import normalize_batch_params
+from app.search import EXA_API_KEY, normalize_batch_params
 
 configure_logging()
 logger = get_logger("api")
@@ -187,6 +187,10 @@ def submit_search(payload: SearchRequest, db: Session = Depends(get_db)) -> Task
         "recency_days": payload.recency_days,
     }
     params = {k: v for k, v in params.items() if v is not None}
+    sources = params.get("sources") or ["brave"]
+    if isinstance(sources, list) and "exa" in [source.lower() for source in sources] and not EXA_API_KEY:
+        log_event(logger, "task_rejected_invalid_params", reason="exa_api_key_missing")
+        raise HTTPException(status_code=400, detail="exa api key missing")
     return create_task_record(
         db=db,
         task_type="search",
@@ -210,6 +214,9 @@ def submit_search_batch(payload: SearchBatchRequest, db: Session = Depends(get_d
     if not search_sources_allowed(normalized["sources"]):
         log_event(logger, "task_rejected_invalid_params", reason="search_source_not_allowed")
         raise HTTPException(status_code=400, detail="search sources not allowed")
+    if "exa" in [source.lower() for source in normalized["sources"]] and not EXA_API_KEY:
+        log_event(logger, "task_rejected_invalid_params", reason="exa_api_key_missing")
+        raise HTTPException(status_code=400, detail="exa api key missing")
 
     return create_task_record(
         db=db,
