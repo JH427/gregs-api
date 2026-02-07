@@ -1,9 +1,9 @@
 import base64
 import uuid
 from datetime import datetime
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from starlette.background import BackgroundTask
 from pydantic import BaseModel
@@ -12,8 +12,8 @@ from sqlalchemy.orm import Session
 from app.db import get_db
 from app.logging_utils import get_logger, log_event
 from app.limits import TASK_MAX_ARTIFACT_MB
-from app.models import Artifact
-from app.storage import get_client, get_object, put_bytes
+from app.models import Artifact, Task
+from app.storage import get_client, get_object, put_bytes, stat_object
 
 router = APIRouter()
 logger = get_logger("api")
@@ -32,6 +32,32 @@ class ArtifactResponse(BaseModel):
     type: str
     content_type: str
     created_at: str
+
+
+class ArtifactListItem(BaseModel):
+    artifact_id: str
+    task_id: str
+    type: str
+    content_type: str
+    created_at: str
+    size_bytes: Optional[int] = None
+
+
+class ArtifactListResponse(BaseModel):
+    task_id: str
+    artifacts: List[ArtifactListItem]
+
+
+class ArtifactIndexItem(BaseModel):
+    artifact_id: str
+    task_id: str
+    type: str
+    content_type: str
+    created_at: str
+
+
+class ArtifactIndexResponse(BaseModel):
+    artifacts: List[ArtifactIndexItem]
 
 
 def build_object_path(task_id: str, artifact_type: str, artifact_id: str) -> str:
@@ -148,3 +174,99 @@ def get_artifact_metadata(artifact_id: str, db: Session = Depends(get_db)) -> Ar
         content_type=artifact.content_type,
         created_at=artifact.created_at.isoformat() + "Z",
     )
+
+
+@router.get("/tasks/{task_id}/artifacts", response_model=ArtifactListResponse)
+def list_task_artifacts(task_id: str, db: Session = Depends(get_db)) -> ArtifactListResponse:
+    task = db.query(Task).filter(Task.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="task not found")
+
+    artifacts = (
+        db.query(Artifact)
+        .filter(Artifact.task_id == task_id)
+        .order_by(Artifact.created_at.asc())
+        .all()
+    )
+
+    client = get_client()
+    items: List[ArtifactListItem] = []
+    for artifact in artifacts:
+        size_bytes = None
+        try:
+            stat = stat_object(client, artifact.path)
+            size_bytes = getattr(stat, "size", None)
+        except Exception:
+            size_bytes = None
+        items.append(
+            ArtifactListItem(
+                artifact_id=artifact.id,
+                task_id=artifact.task_id,
+                type=artifact.type,
+                content_type=artifact.content_type,
+                created_at=artifact.created_at.isoformat() + "Z",
+                size_bytes=size_bytes,
+            )
+        )
+
+    log_event(logger, "artifact_list_requested", task_id=task_id, count=len(items))
+    return ArtifactListResponse(task_id=task_id, artifacts=items)
+
+
+def _parse_iso8601(value: Optional[str]) -> Optional[datetime]:
+    if value is None:
+        return None
+    value = value.strip()
+    if value.endswith("Z"):
+        value = value[:-1]
+    return datetime.fromisoformat(value)
+
+
+@router.get("/artifacts", response_model=ArtifactIndexResponse)
+def list_artifacts(
+    type: Optional[str] = None,
+    task_id: Optional[str] = None,
+    created_after: Optional[str] = None,
+    created_before: Optional[str] = None,
+    limit: int = Query(50, ge=1, le=200),
+    db: Session = Depends(get_db),
+) -> ArtifactIndexResponse:
+    try:
+        after_dt = _parse_iso8601(created_after)
+        before_dt = _parse_iso8601(created_before)
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid datetime filter")
+
+    query = db.query(Artifact)
+    if type:
+        query = query.filter(Artifact.type == type)
+    if task_id:
+        query = query.filter(Artifact.task_id == task_id)
+    if after_dt:
+        query = query.filter(Artifact.created_at >= after_dt)
+    if before_dt:
+        query = query.filter(Artifact.created_at <= before_dt)
+
+    artifacts = query.order_by(Artifact.created_at.asc()).limit(limit).all()
+    items = [
+        ArtifactIndexItem(
+            artifact_id=artifact.id,
+            task_id=artifact.task_id,
+            type=artifact.type,
+            content_type=artifact.content_type,
+            created_at=artifact.created_at.isoformat() + "Z",
+        )
+        for artifact in artifacts
+    ]
+
+    log_event(
+        logger,
+        "artifact_index_requested",
+        type=type,
+        task_id=task_id,
+        created_after=created_after,
+        created_before=created_before,
+        limit=limit,
+        count=len(items),
+    )
+    return ArtifactIndexResponse(artifacts=items)

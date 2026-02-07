@@ -39,3 +39,7 @@ def put_bytes(client: Minio, path: str, data: bytes, content_type: str) -> None:
 
 def get_object(client: Minio, path: str):
     return client.get_object(MINIO_BUCKET, path)
+
+
+def stat_object(client: Minio, path: str):
+    return client.stat_object(MINIO_BUCKET, path)

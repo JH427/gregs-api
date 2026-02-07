@@ -179,6 +179,18 @@ Returns metadata:
 }
 ```
 
+### GET /tasks/{id}/artifacts
+Lists all artifacts created by a task (metadata only, sorted by created_at).
+
+### GET /artifacts
+Global artifact index (read-only).
+Query params:
+- `type`
+- `task_id`
+- `created_after`
+- `created_before`
+- `limit`
+
 ## Deduplication Behavior (Important)
 - The worker computes a **processing key** as: `task.type + hash(normalized_params)`.
 - If a completed run exists for that key, the worker **skips re‑execution** and marks the new task `completed`.

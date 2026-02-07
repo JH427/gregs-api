@@ -187,6 +187,16 @@ Fetch artifact metadata:
 docker compose exec -T api curl -s http://127.0.0.1:8000/artifacts/<artifact_id>/meta
 ```
 
+List artifacts for a task:
+```bash
+docker compose exec -T api curl -s http://127.0.0.1:8000/tasks/<task_id>/artifacts
+```
+
+List artifacts (global index):
+```bash
+docker compose exec -T api curl -s "http://127.0.0.1:8000/artifacts?type=fetch_text&limit=50"
+```
+
 Download artifact by ID:
 ```bash
 docker compose exec -T api curl -s http://127.0.0.1:8000/artifacts/<artifact_id>
