@@ -1,0 +1,104 @@
+version: "3.9"
+
+services:
+  redis:
+    image: redis:7.2-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    networks:
+      - private
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-api}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-api}
+      POSTGRES_DB: ${POSTGRES_DB:-api}
+    volumes:
+      - /mnt/data/postgres:/var/lib/postgresql/data
+    networks:
+      - private
+
+  minio:
+    image: minio/minio:latest
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    volumes:
+      - ./data/minio:/data
+    networks:
+      - private
+
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      - minio
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      MINIO_BUCKET: ${MINIO_BUCKET:-artifacts}
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        for i in $(seq 1 30); do
+          mc alias set local http://minio:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" && break
+          sleep 1
+        done
+        mc mb --ignore-existing local/"$MINIO_BUCKET"
+    networks:
+      - private
+
+  api:
+    build: .
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--log-config", "/app/app/logging_config.json"]
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg2://api:api@postgres:5432/api}
+      LOG_CONFIG: /app/app/logging_config.json
+      BRAVE_API_KEY: ${BRAVE_API_KEY}
+      BRAVE_API_URL: ${BRAVE_API_URL:-https://api.search.brave.com/res/v1/web/search}
+      SEARCH_CACHE_TTL_SECONDS: ${SEARCH_CACHE_TTL_SECONDS:-3600}
+      SEARCH_MAX_RESULTS: ${SEARCH_MAX_RESULTS:-10}
+      MINIO_ENDPOINT: ${MINIO_ENDPOINT:-minio:9000}
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      MINIO_BUCKET: ${MINIO_BUCKET:-artifacts}
+      MINIO_SECURE: ${MINIO_SECURE:-false}
+    depends_on:
+      - redis
+      - postgres
+      - minio
+      - minio-init
+    networks:
+      - private
+
+  worker:
+    build: .
+    command: ["python", "-m", "worker.worker"]
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg2://api:api@postgres:5432/api}
+      LOG_CONFIG: /app/app/logging_config.json
+      BRAVE_API_KEY: ${BRAVE_API_KEY}
+      BRAVE_API_URL: ${BRAVE_API_URL:-https://api.search.brave.com/res/v1/web/search}
+      SEARCH_CACHE_TTL_SECONDS: ${SEARCH_CACHE_TTL_SECONDS:-3600}
+      SEARCH_MAX_RESULTS: ${SEARCH_MAX_RESULTS:-10}
+      MINIO_ENDPOINT: ${MINIO_ENDPOINT:-minio:9000}
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      MINIO_BUCKET: ${MINIO_BUCKET:-artifacts}
+      MINIO_SECURE: ${MINIO_SECURE:-false}
+    depends_on:
+      - redis
+      - postgres
+      - minio
+      - minio-init
+    networks:
+      - private
+    restart: always
+
+networks:
+  private:
+    driver: bridge
