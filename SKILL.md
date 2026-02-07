@@ -5,6 +5,7 @@ This skill teaches Greg how to use the internal Task Runner + Queue API hosted a
 ## What This API Does
 - **Asynchronous tasks** with a stable contract (`/tasks`, `/tasks/{id}`, `/tasks/{id}/cancel`, `/health`).
 - **Search** is exposed via `/search`, but still executes as a queued task.
+- **Batch search** is exposed via `/search/batch` and enqueues a single task for many queries.
 - **Artifacts** store large outputs in MinIO and are fetched via `/artifacts/{id}`.
 - **Deduplication** is automatic in the worker based on normalized params. Duplicate tasks converge to prior results.
 
@@ -21,7 +22,7 @@ This skill teaches Greg how to use the internal Task Runner + Queue API hosted a
 - Cloudflare Access sits in front of the API. Use a session/token that has Access approved. If Access is not satisfied, requests will be blocked.
 
 ## Task Lifecycle
-1. **Create task** (enqueue): `POST /tasks` or `POST /search`
+1. **Create task** (enqueue): `POST /tasks`, `POST /search`, or `POST /search/batch`
 2. **Poll**: `GET /tasks/{id}` until status is `completed`, `failed`, or `cancelled`
 3. **Fetch artifacts** if returned in `result.artifact_ids`
 
@@ -99,6 +100,25 @@ Response (202):
 
 Poll via `GET /tasks/{id}`. Normalized results are stored in an artifact with type `search_results`. Raw provider responses are stored as `search_raw` artifacts.
 
+### POST /search/batch
+Enqueues a batch search task (never synchronous). One task handles multiple queries.
+
+Request:
+```json
+{
+  "queries": ["query one", "query two"],
+  "sources": ["brave"],
+  "recency_days": 7
+}
+```
+
+Response (202):
+```json
+{ "task_id": "...", "status": "queued" }
+```
+
+Poll via `GET /tasks/{id}`. Grouped results are stored in an artifact with type `search_batch_results`. Raw provider responses are stored as `search_raw` artifacts.
+
 ## Artifacts
 ### GET /artifacts/{id}
 Fetches artifact content (streamed).
@@ -139,6 +159,18 @@ curl -s -X POST https://api.fullyautomated.dev/search \
 
 curl -s https://api.fullyautomated.dev/tasks/<task_id>
 # -> result.artifact_ids includes search_results
+
+curl -s https://api.fullyautomated.dev/artifacts/<artifact_id>
+```
+
+### 2b) Submit a batch search, fetch grouped results artifact
+```bash
+curl -s -X POST https://api.fullyautomated.dev/search/batch \
+  -H 'Content-Type: application/json' \
+  -d '{"queries":["queue worker redis","fastapi task runner"],"sources":["brave"],"recency_days":7}'
+
+curl -s https://api.fullyautomated.dev/tasks/<task_id>
+# -> result.artifact_ids includes search_batch_results
 
 curl -s https://api.fullyautomated.dev/artifacts/<artifact_id>
 ```

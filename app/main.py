@@ -19,10 +19,12 @@ from app.limits import (
     TASK_MAX_RUNTIME_SECONDS,
     TASKS_PER_MINUTE,
     rate_limit_check,
+    search_sources_allowed,
 )
 from app.models import Task
 from app.queue import enqueue_task, get_redis, WORKER_HEARTBEAT_KEY
 from app.storage import ensure_bucket, get_client
+from app.search import normalize_batch_params
 
 configure_logging()
 logger = get_logger("api")
@@ -62,6 +64,12 @@ class SearchRequest(BaseModel):
     recency_days: Optional[int] = None
 
 
+class SearchBatchRequest(BaseModel):
+    queries: list[str]
+    sources: Optional[list[str]] = None
+    recency_days: Optional[int] = None
+
+
 @app.on_event("startup")
 def on_startup() -> None:
     init_db()
@@ -79,6 +87,7 @@ def create_task_record(
     idempotency_key: Optional[str],
     timeout_seconds: int,
     max_retries: int,
+    allowed_types: Optional[set[str]] = None,
 ) -> TaskCreateResponse:
     allowed, current = rate_limit_check()
     if not allowed:
@@ -90,7 +99,9 @@ def create_task_record(
             current=current,
         )
         raise HTTPException(status_code=429, detail="rate_limit_exceeded")
-    if task_type not in {"echo", "sleep", "search"}:
+    if allowed_types is None:
+        allowed_types = {"echo", "sleep", "search"}
+    if task_type not in allowed_types:
         raise HTTPException(status_code=400, detail="unsupported task type")
 
     if task_type == "sleep":
@@ -183,6 +194,31 @@ def submit_search(payload: SearchRequest, db: Session = Depends(get_db)) -> Task
         idempotency_key=None,
         timeout_seconds=300,
         max_retries=0,
+    )
+
+
+@app.post("/search/batch", response_model=TaskCreateResponse, status_code=status.HTTP_202_ACCEPTED)
+def submit_search_batch(payload: SearchBatchRequest, db: Session = Depends(get_db)) -> TaskCreateResponse:
+    try:
+        normalized = normalize_batch_params(payload.dict())
+    except Exception as exc:
+        log_event(logger, "task_rejected_invalid_params", reason=str(exc))
+        raise HTTPException(status_code=400, detail="invalid batch search params")
+    if len(normalized["queries"]) > MAX_BATCH_SIZE:
+        log_event(logger, "task_rejected_invalid_params", reason="batch_size_exceeded", limit=MAX_BATCH_SIZE)
+        raise HTTPException(status_code=400, detail="batch size exceeded")
+    if not search_sources_allowed(normalized["sources"]):
+        log_event(logger, "task_rejected_invalid_params", reason="search_source_not_allowed")
+        raise HTTPException(status_code=400, detail="search sources not allowed")
+
+    return create_task_record(
+        db=db,
+        task_type="search_batch",
+        params=normalized,
+        idempotency_key=None,
+        timeout_seconds=300,
+        max_retries=0,
+        allowed_types={"search_batch"},
     )
 
 

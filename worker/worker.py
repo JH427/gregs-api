@@ -19,7 +19,7 @@ from app.db_helpers import (
     update_run_status,
 )
 from app.logging_utils import configure_logging, get_logger, log_event, log_task_transition
-from app.limits import SEARCH_SOURCE_ALLOWLIST, TASK_MAX_RUNTIME_SECONDS
+from app.limits import MAX_BATCH_SIZE, SEARCH_SOURCE_ALLOWLIST, TASK_MAX_RUNTIME_SECONDS, search_sources_allowed
 from app.models import Task
 from app.queue import (
     PROCESSING_NAME,
@@ -32,7 +32,14 @@ from app.queue import (
     requeue_inflight,
     update_worker_heartbeat,
 )
-from app.search import normalize_params, run_search_task
+from app.search import (
+    TaskCancelled,
+    TaskRuntimeExceeded,
+    normalize_batch_params,
+    normalize_params,
+    run_search_batch_task,
+    run_search_task,
+)
 from app.storage import ensure_bucket, get_client
 
 POLL_TIMEOUT = int(os.getenv("WORKER_POLL_TIMEOUT", "5"))
@@ -114,7 +121,15 @@ def refresh_task(db: Session, task: Task) -> Task:
 
 def _normalize_params_for_task(task: Task) -> dict:
     if task.type == "search":
-        return normalize_params(task.params_json)
+        try:
+            return normalize_params(task.params_json)
+        except Exception:
+            return task.params_json or {}
+    if task.type == "search_batch":
+        try:
+            return normalize_batch_params(task.params_json)
+        except Exception:
+            return task.params_json or {}
     if task.type == "sleep":
         return {"seconds": int(task.params_json.get("seconds", 0))}
     return task.params_json or {}
@@ -275,6 +290,114 @@ def execute_task(db: Session, task: Task) -> bool:
                 return False
             redis_client = connect_redis()
             result = run_search_task(db, task.id, task.params_json, redis_client, logger)
+            if time.time() - start_time > TASK_MAX_RUNTIME_SECONDS:
+                log_event(logger, "task_killed", task_id=task.id, reason="runtime_limit", limit=TASK_MAX_RUNTIME_SECONDS)
+                mark_failed(db, task, "task_runtime_exceeded")
+                update_run_status(db, run, "failed")
+                return False
+            task = refresh_task(db, task)
+            if task.cancel_requested:
+                mark_cancelled(db, task)
+                update_run_status(db, run, "failed")
+                create_metric(
+                    db,
+                    name="duration_ms",
+                    value=int((time.time() - start_time) * 1000),
+                    run_id=run.id,
+                    task_id=task.id,
+                )
+                return False
+        elif task.type == "search_batch":
+            task = refresh_task(db, task)
+            if task.cancel_requested:
+                mark_cancelled(db, task)
+                update_run_status(db, run, "failed")
+                create_metric(
+                    db,
+                    name="duration_ms",
+                    value=int((time.time() - start_time) * 1000),
+                    run_id=run.id,
+                    task_id=task.id,
+                )
+                return False
+            try:
+                normalized = normalize_batch_params(task.params_json)
+            except Exception as exc:
+                log_event(
+                    logger,
+                    "task_rejected_invalid_params",
+                    task_id=task.id,
+                    reason=str(exc),
+                )
+                mark_failed(db, task, "task_rejected_invalid_params")
+                update_run_status(db, run, "failed")
+                return False
+            sources = normalized["sources"]
+            queries = normalized["queries"]
+            if len(queries) > MAX_BATCH_SIZE:
+                log_event(
+                    logger,
+                    "task_rejected_invalid_params",
+                    task_id=task.id,
+                    reason="batch_size_exceeded",
+                    limit=MAX_BATCH_SIZE,
+                )
+                mark_failed(db, task, "task_rejected_invalid_params")
+                update_run_status(db, run, "failed")
+                return False
+            if not search_sources_allowed(sources):
+                log_event(
+                    logger,
+                    "task_rejected_invalid_params",
+                    task_id=task.id,
+                    reason="search_source_not_allowed",
+                    allowlist=SEARCH_SOURCE_ALLOWLIST,
+                )
+                mark_failed(db, task, "task_rejected_invalid_params")
+                update_run_status(db, run, "failed")
+                return False
+            if time.time() - start_time > TASK_MAX_RUNTIME_SECONDS:
+                log_event(logger, "task_killed", task_id=task.id, reason="runtime_limit", limit=TASK_MAX_RUNTIME_SECONDS)
+                mark_failed(db, task, "task_runtime_exceeded")
+                update_run_status(db, run, "failed")
+                return False
+            redis_client = connect_redis()
+
+            def should_abort() -> Optional[str]:
+                nonlocal task
+                task = refresh_task(db, task)
+                if task.cancel_requested:
+                    return "cancelled"
+                if time.time() - start_time > TASK_MAX_RUNTIME_SECONDS:
+                    return "runtime_limit"
+                return None
+
+            try:
+                result = run_search_batch_task(
+                    db,
+                    task.id,
+                    task.params_json,
+                    redis_client,
+                    logger,
+                    normalized=normalized,
+                    should_abort=should_abort,
+                )
+            except TaskCancelled:
+                mark_cancelled(db, task)
+                update_run_status(db, run, "failed")
+                create_metric(
+                    db,
+                    name="duration_ms",
+                    value=int((time.time() - start_time) * 1000),
+                    run_id=run.id,
+                    task_id=task.id,
+                )
+                return False
+            except TaskRuntimeExceeded:
+                log_event(logger, "task_killed", task_id=task.id, reason="runtime_limit", limit=TASK_MAX_RUNTIME_SECONDS)
+                mark_failed(db, task, "task_runtime_exceeded")
+                update_run_status(db, run, "failed")
+                return False
             if time.time() - start_time > TASK_MAX_RUNTIME_SECONDS:
                 log_event(logger, "task_killed", task_id=task.id, reason="runtime_limit", limit=TASK_MAX_RUNTIME_SECONDS)
                 mark_failed(db, task, "task_runtime_exceeded")

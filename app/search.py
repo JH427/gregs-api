@@ -4,14 +4,17 @@ import os
 import urllib.parse
 import urllib.request
 from datetime import datetime
-from typing import Any, Dict, List, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import redis
 from sqlalchemy.orm import Session
 
 from app.artifacts import create_artifact_record
 from app.cache import SEARCH_CACHE_TTL_SECONDS, build_cache_key, get_cache, set_cache
+from app.limits import MAX_BATCH_SIZE
 from app.logging_utils import log_event
+from app.models import Artifact
+from app.storage import get_client, get_object
 
 BRAVE_API_URL = os.getenv("BRAVE_API_URL", "https://api.search.brave.com/res/v1/web/search")
 BRAVE_API_KEY = os.getenv("BRAVE_API_KEY")
@@ -53,11 +56,22 @@ class BraveSearchProvider(SearchProvider):
         return json.loads(body)
 
 
-def normalize_params(params: Dict[str, Any]) -> Dict[str, Any]:
-    query = params.get("query")
+class TaskCancelled(Exception):
+    pass
+
+
+class TaskRuntimeExceeded(Exception):
+    pass
+
+
+def _normalize_query(query: str) -> str:
     if not isinstance(query, str) or not query.strip():
         raise ValueError("query is required")
-    query = " ".join(query.split()).strip()
+    return " ".join(query.split()).strip()
+
+
+def normalize_params(params: Dict[str, Any]) -> Dict[str, Any]:
+    query = _normalize_query(params.get("query"))
 
     sources = params.get("sources")
     if sources is None:
@@ -78,6 +92,40 @@ def normalize_params(params: Dict[str, Any]) -> Dict[str, Any]:
 
     return {
         "query": query,
+        "sources": sorted(set(normalized_sources)),
+        "recency_days": recency_days,
+    }
+
+
+def normalize_batch_params(params: Dict[str, Any]) -> Dict[str, Any]:
+    queries = params.get("queries")
+    if not isinstance(queries, list) or not queries:
+        raise ValueError("queries must be a non-empty list")
+    normalized_queries: List[str] = []
+    for query in queries:
+        normalized_queries.append(_normalize_query(query))
+    if len(normalized_queries) > MAX_BATCH_SIZE:
+        raise ValueError("batch_size_exceeded")
+
+    sources = params.get("sources")
+    if sources is None:
+        sources = ["brave"]
+    if not isinstance(sources, list) or not sources:
+        raise ValueError("sources must be a non-empty list")
+    normalized_sources = []
+    for source in sources:
+        if not isinstance(source, str) or not source.strip():
+            raise ValueError("sources must contain non-empty strings")
+        normalized_sources.append(source.strip().lower())
+
+    recency_days = params.get("recency_days", 7)
+    if recency_days is None:
+        recency_days = 7
+    if not isinstance(recency_days, int) or recency_days < 0:
+        raise ValueError("recency_days must be a non-negative integer")
+
+    return {
+        "queries": sorted(normalized_queries),
         "sources": sorted(set(normalized_sources)),
         "recency_days": recency_days,
     }
@@ -163,6 +211,172 @@ def run_search_task(
     except Exception as exc:
         log_event(logger, "search_task_failed", task_id=task_id, error=str(exc))
         raise
+
+
+def _load_cached_results(
+    db: Session,
+    cached_value: Dict[str, Any],
+    logger,
+) -> Optional[Dict[str, Any]]:
+    if not isinstance(cached_value, dict):
+        return None
+    artifact_ids = cached_value.get("artifact_ids")
+    if not isinstance(artifact_ids, list) or not artifact_ids:
+        return None
+    artifact = (
+        db.query(Artifact)
+        .filter(Artifact.id.in_(artifact_ids), Artifact.type == "search_results")
+        .first()
+    )
+    if not artifact:
+        return None
+    obj = None
+    try:
+        client = get_client()
+        obj = get_object(client, artifact.path)
+        body = obj.read()
+        payload = json.loads(body.decode("utf-8"))
+        return payload if isinstance(payload, dict) else None
+    except Exception:
+        return None
+    finally:
+        try:
+            if obj is not None:
+                obj.close()
+        except Exception:
+            pass
+
+
+def run_search_batch_task(
+    db: Session,
+    task_id: str,
+    params: Dict[str, Any],
+    redis_client: redis.Redis,
+    logger,
+    normalized: Optional[Dict[str, Any]] = None,
+    should_abort: Optional[Callable[[], Optional[str]]] = None,
+) -> Dict[str, Any]:
+    if normalized is None:
+        normalized = normalize_batch_params(params)
+    queries = normalized["queries"]
+    sources = normalized["sources"]
+    recency_days = normalized["recency_days"]
+
+    log_event(
+        logger,
+        "search_batch_started",
+        task_id=task_id,
+        query_count=len(queries),
+        sources=sources,
+        recency_days=recency_days,
+    )
+
+    grouped_results: List[Dict[str, Any]] = []
+    artifact_ids: List[str] = []
+
+    for query in queries:
+        if should_abort:
+            reason = should_abort()
+            if reason == "cancelled":
+                raise TaskCancelled()
+            if reason == "runtime_limit":
+                raise TaskRuntimeExceeded()
+
+        cache_key = build_cache_key(compute_cache_key(query, sources, recency_days))
+        cached_value = get_cache(redis_client, cache_key)
+        cached_payload = _load_cached_results(db, cached_value, logger) if cached_value else None
+        if cached_payload:
+            log_event(logger, "search_batch_cached_hit", task_id=task_id, cache_key=cache_key, query=query)
+            grouped_results.append(
+                {
+                    "query": cached_payload.get("query", query),
+                    "results": cached_payload.get("results", []),
+                    "sources_used": cached_payload.get("sources_used", sources),
+                    "retrieved_at": cached_payload.get("retrieved_at"),
+                    "cached": True,
+                }
+            )
+            cached_artifact_ids = cached_value.get("artifact_ids") if isinstance(cached_value, dict) else None
+            if isinstance(cached_artifact_ids, list):
+                artifact_ids.extend(cached_artifact_ids)
+            continue
+
+        log_event(logger, "search_batch_provider_call", task_id=task_id, query=query, sources=sources)
+        results, raw_payloads, sources_used = call_providers(query, sources, recency_days, logger)
+        per_query_artifacts: List[str] = []
+        for provider_name, raw_payload in raw_payloads:
+            data = json.dumps(raw_payload).encode("utf-8")
+            artifact = create_artifact_record(
+                db=db,
+                task_id=task_id,
+                artifact_type="search_raw",
+                content_type="application/json",
+                data=data,
+                event_logger=logger,
+            )
+            per_query_artifacts.append(artifact.id)
+
+        summary = f"{len(results)} results from {', '.join(sources_used)}"
+        normalized_payload = {
+            "query": query,
+            "results": results,
+            "sources_used": sources_used,
+            "retrieved_at": datetime.utcnow().isoformat() + "Z",
+        }
+        normalized_artifact = create_artifact_record(
+            db=db,
+            task_id=task_id,
+            artifact_type="search_results",
+            content_type="application/json",
+            data=json.dumps(normalized_payload).encode("utf-8"),
+            event_logger=logger,
+        )
+        per_query_artifacts.insert(0, normalized_artifact.id)
+        artifact_ids.extend(per_query_artifacts)
+        grouped_results.append(
+            {
+                "query": query,
+                "results": results,
+                "sources_used": sources_used,
+                "retrieved_at": normalized_payload["retrieved_at"],
+                "cached": False,
+            }
+        )
+
+        cache_payload = {
+            "artifact_ids": per_query_artifacts,
+            "summary": summary,
+        }
+        try:
+            set_cache(redis_client, cache_key, cache_payload, SEARCH_CACHE_TTL_SECONDS)
+        except Exception:
+            pass
+
+    batch_payload = {"queries": grouped_results}
+    batch_artifact = create_artifact_record(
+        db=db,
+        task_id=task_id,
+        artifact_type="search_batch_results",
+        content_type="application/json",
+        data=json.dumps(batch_payload).encode("utf-8"),
+        event_logger=logger,
+    )
+
+    unique_ids: List[str] = []
+    seen = set()
+    for artifact_id in artifact_ids:
+        if artifact_id in seen:
+            continue
+        seen.add(artifact_id)
+        unique_ids.append(artifact_id)
+
+    result_payload = {
+        "artifact_ids": [batch_artifact.id] + unique_ids,
+        "summary": f"Batch search completed: {len(queries)} queries",
+    }
+
+    log_event(logger, "search_batch_completed", task_id=task_id, query_count=len(queries), artifact_id=batch_artifact.id)
+    return result_payload
 
 
 def call_providers(

@@ -58,6 +58,7 @@ Search:
 - `BRAVE_API_KEY` (required for provider calls)
 - `SEARCH_CACHE_TTL_SECONDS` (default `3600`)
 - `SEARCH_MAX_RESULTS` (default `10`)
+- `MAX_BATCH_SIZE` (default `50`)
 
 MinIO:
 - `MINIO_ROOT_USER`
@@ -137,6 +138,15 @@ Submit search task:
 docker compose exec -T api curl -s -X POST http://127.0.0.1:8000/search \
   -H 'Content-Type: application/json' \
   -d '{"query":"open source task runner","sources":["brave"],"recency_days":7}'
+```
+
+Batch search results are stored in an artifact with type `search_batch_results` (grouped results per query).
+
+Submit batch search task:
+```bash
+docker compose exec -T api curl -s -X POST http://127.0.0.1:8000/search/batch \
+  -H 'Content-Type: application/json' \
+  -d '{"queries":["task runner open source","queue worker redis"],"sources":["brave"],"recency_days":7}'
 ```
 
 Poll for results:
