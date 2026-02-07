@@ -20,11 +20,13 @@ from app.limits import (
     TASKS_PER_MINUTE,
     rate_limit_check,
     search_sources_allowed,
+    validate_fetch_domain,
 )
 from app.models import Task
 from app.queue import enqueue_task, get_redis, WORKER_HEARTBEAT_KEY
 from app.storage import ensure_bucket, get_client
 from app.search import EXA_API_KEY, normalize_batch_params
+from app.fetch import canonicalize_url, normalize_fetch_params
 
 configure_logging()
 logger = get_logger("api")
@@ -68,6 +70,12 @@ class SearchBatchRequest(BaseModel):
     queries: list[str]
     sources: Optional[list[str]] = None
     recency_days: Optional[int] = None
+
+
+class FetchRequest(BaseModel):
+    url: str
+    reader_mode: Optional[bool] = True
+    store_raw_html: Optional[bool] = False
 
 
 @app.on_event("startup")
@@ -226,6 +234,38 @@ def submit_search_batch(payload: SearchBatchRequest, db: Session = Depends(get_d
         timeout_seconds=300,
         max_retries=0,
         allowed_types={"search_batch"},
+    )
+
+
+@app.post("/fetch", response_model=TaskCreateResponse, status_code=status.HTTP_202_ACCEPTED)
+def submit_fetch(payload: FetchRequest, db: Session = Depends(get_db)) -> TaskCreateResponse:
+    try:
+        canonical_url = canonicalize_url(payload.url)
+    except Exception:
+        log_event(logger, "task_rejected_invalid_params", reason="invalid_url")
+        raise HTTPException(status_code=400, detail="invalid url")
+    if not validate_fetch_domain(canonical_url):
+        log_event(logger, "task_rejected_invalid_params", reason="fetch_domain_not_allowed")
+        raise HTTPException(status_code=400, detail="fetch domain not allowed")
+    params: Dict[str, Any] = {
+        "url": canonical_url,
+        "reader_mode": bool(payload.reader_mode),
+        "store_raw_html": bool(payload.store_raw_html),
+    }
+    # Normalize once to ensure deterministic parameters.
+    try:
+        normalize_fetch_params(params)
+    except Exception:
+        log_event(logger, "task_rejected_invalid_params", reason="invalid_fetch_params")
+        raise HTTPException(status_code=400, detail="invalid fetch params")
+    return create_task_record(
+        db=db,
+        task_type="fetch_url",
+        params=params,
+        idempotency_key=None,
+        timeout_seconds=300,
+        max_retries=0,
+        allowed_types={"fetch_url"},
     )
 
 

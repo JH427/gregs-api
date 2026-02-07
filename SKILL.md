@@ -6,6 +6,7 @@ This skill teaches Greg how to use the internal Task Runner + Queue API hosted a
 - **Asynchronous tasks** with a stable contract (`/tasks`, `/tasks/{id}`, `/tasks/{id}/cancel`, `/health`).
 - **Search** is exposed via `/search`, but still executes as a queued task.
 - **Batch search** is exposed via `/search/batch` and enqueues a single task for many queries.
+- **Fetch** is exposed via `/fetch` and extracts readable text from a URL.
 - **Artifacts** store large outputs in MinIO and are fetched via `/artifacts/{id}`.
 - **Deduplication** is automatic in the worker based on normalized params. Duplicate tasks converge to prior results.
 
@@ -140,6 +141,28 @@ Exa notes:
 - If you request `exa` and the key is missing, the task is rejected deterministically.
 - `recency_days` is mapped to a published-date filter on Exa (best-effort).
 
+## Fetch API
+### POST /fetch
+Fetch a URL and extract readable text (never synchronous).
+
+Request:
+```json
+{
+  "url": "https://example.com/article",
+  "reader_mode": true,
+  "store_raw_html": true
+}
+```
+
+Response (202):
+```json
+{ "task_id": "...", "status": "queued" }
+```
+
+Notes:
+- Domain allowlist is enforced via `FETCH_DOMAIN_ALLOWLIST`.
+- Results are stored as `fetch_text` (and `fetch_html` if requested).
+
 ## Artifacts
 ### GET /artifacts/{id}
 Fetches artifact content (streamed).
@@ -192,6 +215,18 @@ curl -s -X POST https://api.fullyautomated.dev/search/batch \
 
 curl -s https://api.fullyautomated.dev/tasks/<task_id>
 # -> result.artifact_ids includes search_batch_results
+
+curl -s https://api.fullyautomated.dev/artifacts/<artifact_id>
+```
+
+### 2c) Fetch a URL (reader mode)
+```bash
+curl -s -X POST https://api.fullyautomated.dev/fetch \
+  -H 'Content-Type: application/json' \
+  -d '{"url":"https://example.com/article","reader_mode":true,"store_raw_html":true}'
+
+curl -s https://api.fullyautomated.dev/tasks/<task_id>
+# -> result.artifact_ids includes fetch_text (and fetch_html if requested)
 
 curl -s https://api.fullyautomated.dev/artifacts/<artifact_id>
 ```

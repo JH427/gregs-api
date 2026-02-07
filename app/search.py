@@ -67,7 +67,8 @@ class ExaSearchProvider(SearchProvider):
             raise RuntimeError("EXA_API_KEY is not set")
 
         # Exa Search API: POST https://api.exa.ai/search
-        # Auth: x-api-key header OR Authorization: Bearer <key>
+        # Auth: x-api-key header (Authorization: Bearer also supported per Exa docs).
+        # Contents: request text via contents.text=true.
         payload: Dict[str, Any] = {
             "query": query,
             "numResults": SEARCH_MAX_RESULTS,

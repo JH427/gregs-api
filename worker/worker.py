@@ -19,7 +19,13 @@ from app.db_helpers import (
     update_run_status,
 )
 from app.logging_utils import configure_logging, get_logger, log_event, log_task_transition
-from app.limits import MAX_BATCH_SIZE, SEARCH_SOURCE_ALLOWLIST, TASK_MAX_RUNTIME_SECONDS, search_sources_allowed
+from app.limits import (
+    MAX_BATCH_SIZE,
+    SEARCH_SOURCE_ALLOWLIST,
+    TASK_MAX_RUNTIME_SECONDS,
+    search_sources_allowed,
+    validate_fetch_domain,
+)
 from app.models import Task
 from app.queue import (
     PROCESSING_NAME,
@@ -41,6 +47,7 @@ from app.search import (
     run_search_batch_task,
     run_search_task,
 )
+from app.fetch import normalize_fetch_params, run_fetch_task
 from app.storage import ensure_bucket, get_client
 
 POLL_TIMEOUT = int(os.getenv("WORKER_POLL_TIMEOUT", "5"))
@@ -129,6 +136,11 @@ def _normalize_params_for_task(task: Task) -> dict:
     if task.type == "search_batch":
         try:
             return normalize_batch_params(task.params_json)
+        except Exception:
+            return task.params_json or {}
+    if task.type == "fetch_url":
+        try:
+            return normalize_fetch_params(task.params_json)
         except Exception:
             return task.params_json or {}
     if task.type == "sleep":
@@ -430,6 +442,66 @@ def execute_task(db: Session, task: Task) -> bool:
                 mark_failed(db, task, "task_runtime_exceeded")
                 update_run_status(db, run, "failed")
                 return False
+            if time.time() - start_time > TASK_MAX_RUNTIME_SECONDS:
+                log_event(logger, "task_killed", task_id=task.id, reason="runtime_limit", limit=TASK_MAX_RUNTIME_SECONDS)
+                mark_failed(db, task, "task_runtime_exceeded")
+                update_run_status(db, run, "failed")
+                return False
+            task = refresh_task(db, task)
+            if task.cancel_requested:
+                mark_cancelled(db, task)
+                update_run_status(db, run, "failed")
+                create_metric(
+                    db,
+                    name="duration_ms",
+                    value=int((time.time() - start_time) * 1000),
+                    run_id=run.id,
+                    task_id=task.id,
+                )
+                return False
+        elif task.type == "fetch_url":
+            task = refresh_task(db, task)
+            if task.cancel_requested:
+                mark_cancelled(db, task)
+                update_run_status(db, run, "failed")
+                create_metric(
+                    db,
+                    name="duration_ms",
+                    value=int((time.time() - start_time) * 1000),
+                    run_id=run.id,
+                    task_id=task.id,
+                )
+                return False
+            try:
+                normalized = normalize_fetch_params(task.params_json)
+            except Exception as exc:
+                log_event(
+                    logger,
+                    "task_rejected_invalid_params",
+                    task_id=task.id,
+                    reason=str(exc),
+                )
+                mark_failed(db, task, "task_rejected_invalid_params")
+                update_run_status(db, run, "failed")
+                return False
+            canonical_url = normalized["canonical_url"]
+            if not validate_fetch_domain(canonical_url):
+                log_event(
+                    logger,
+                    "task_rejected_invalid_params",
+                    task_id=task.id,
+                    reason="fetch_domain_not_allowed",
+                )
+                mark_failed(db, task, "task_rejected_invalid_params")
+                update_run_status(db, run, "failed")
+                return False
+            if time.time() - start_time > TASK_MAX_RUNTIME_SECONDS:
+                log_event(logger, "task_killed", task_id=task.id, reason="runtime_limit", limit=TASK_MAX_RUNTIME_SECONDS)
+                mark_failed(db, task, "task_runtime_exceeded")
+                update_run_status(db, run, "failed")
+                return False
+            redis_client = connect_redis()
+            result = run_fetch_task(db, task.id, task.params_json, redis_client, logger)
             if time.time() - start_time > TASK_MAX_RUNTIME_SECONDS:
                 log_event(logger, "task_killed", task_id=task.id, reason="runtime_limit", limit=TASK_MAX_RUNTIME_SECONDS)
                 mark_failed(db, task, "task_runtime_exceeded")

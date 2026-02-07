@@ -11,6 +11,7 @@ FastAPI API + worker + Redis queue + PostgreSQL persistence + Search Aggregator 
 - `app/queue.py` Redis queue helpers
 - `app/cache.py` Search cache helpers
 - `app/search.py` Search task logic + provider adapter
+- `app/fetch.py` Fetch task logic + reader extraction + cache
 - `app/artifacts.py` Artifact API + DB helpers
 - `app/storage.py` MinIO client helpers
 - `app/logging_utils.py` JSON logging helpers
@@ -61,6 +62,10 @@ Search:
 - `SEARCH_MAX_RESULTS` (default `10`)
 - `MAX_BATCH_SIZE` (default `50`)
 - `EXA_API_URL` (optional, default `https://api.exa.ai/search`)
+
+Fetch:
+- `FETCH_CACHE_TTL_SECONDS` (default `3600`)
+- `FETCH_DOMAIN_ALLOWLIST` (default `*`)
 
 MinIO:
 - `MINIO_ROOT_USER`
@@ -163,6 +168,13 @@ Poll for results:
 docker compose exec -T api curl -s http://127.0.0.1:8000/tasks/<task_id>
 ```
 
+Submit fetch task:
+```bash
+docker compose exec -T api curl -s -X POST http://127.0.0.1:8000/fetch \
+  -H 'Content-Type: application/json' \
+  -d '{"url":"https://example.com/article","reader_mode":true,"store_raw_html":true}'
+```
+
 Create an artifact (JSON + base64):
 ```bash
 docker compose exec -T api curl -s -X POST http://127.0.0.1:8000/artifacts \
@@ -246,3 +258,26 @@ Provider guidance:
 Recency notes:
 - For Exa, `recency_days` is mapped to `startPublishedDate` (best-effort).
 - If `recency_days <= 0`, Exa does not apply a published-date filter.
+
+## Phase 8B — Fetch / Reader
+Fetch extracts readable text from a URL and stores it as artifacts.
+
+Behavior:
+- One request creates one task of type `fetch_url`.
+- Clean text is stored in a `fetch_text` artifact.
+- Raw HTML is stored as `fetch_html` only when `store_raw_html=true`.
+- Cache key is the canonicalized URL; identical fetches reuse artifacts.
+
+Endpoint:
+```bash
+POST /fetch
+```
+
+Request:
+```json
+{
+  "url": "https://example.com/article",
+  "reader_mode": true,
+  "store_raw_html": true
+}
+```
