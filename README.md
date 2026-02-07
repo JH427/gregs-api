@@ -195,3 +195,30 @@ Enforcement:
 
 Limits introspection:
 - `GET /limits` returns the effective limits.
+
+## Phase 8A — Batch Search
+Batch search lets you submit multiple queries in one request while still executing asynchronously.
+
+Behavior:
+- One request creates one task of type `search_batch`.
+- Results are grouped into a single artifact with type `search_batch_results`.
+- Per-query cache reuse uses the same cache key as single-search, so overlapping batches benefit from cached results.
+- Identical batch requests dedupe to the same artifacts (fast convergence).
+- Batch size is enforced by `MAX_BATCH_SIZE` (1–50).
+
+Endpoint:
+```bash
+POST /search/batch
+```
+
+Request:
+```json
+{
+  "queries": ["query one", "query two"],
+  "sources": ["brave"],
+  "recency_days": 7
+}
+```
+
+Result:
+- `GET /tasks/{id}` returns `result.artifact_ids` with the grouped `search_batch_results` artifact plus any per-query artifacts.

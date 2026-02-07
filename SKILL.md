@@ -103,6 +103,10 @@ Poll via `GET /tasks/{id}`. Normalized results are stored in an artifact with ty
 ### POST /search/batch
 Enqueues a batch search task (never synchronous). One task handles multiple queries.
 
+Constraints:
+- `queries` length must be between 1 and `MAX_BATCH_SIZE` (default 50).
+- `sources` must be allowed (default allowlist: `brave` only).
+
 Request:
 ```json
 {
@@ -118,6 +122,11 @@ Response (202):
 ```
 
 Poll via `GET /tasks/{id}`. Grouped results are stored in an artifact with type `search_batch_results`. Raw provider responses are stored as `search_raw` artifacts.
+
+Batch caching:
+- Each query uses the same cache key as single-search.
+- Overlapping batches reuse cached results.
+- Identical batches dedupe to prior artifacts.
 
 ## Artifacts
 ### GET /artifacts/{id}
