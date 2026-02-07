@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 
 from app.db import get_db
 from app.logging_utils import get_logger, log_event
+from app.limits import TASK_MAX_ARTIFACT_MB
 from app.models import Artifact
 from app.storage import get_client, get_object, put_bytes
 
@@ -45,6 +46,18 @@ def create_artifact_record(
     data: bytes,
     event_logger=None,
 ) -> Artifact:
+    size_mb = len(data) / (1024 * 1024)
+    if size_mb > TASK_MAX_ARTIFACT_MB:
+        log_event(
+            event_logger,
+            "artifact_rejected",
+            task_id=task_id,
+            type=artifact_type,
+            size_mb=round(size_mb, 2),
+            limit_mb=TASK_MAX_ARTIFACT_MB,
+            reason="artifact_size_exceeded",
+        )
+        raise ValueError("artifact_size_exceeded")
     artifact_id = str(uuid.uuid4())
     path = build_object_path(task_id, artifact_type, artifact_id)
 

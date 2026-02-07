@@ -11,6 +11,15 @@ from sqlalchemy.orm import Session
 from app.db import check_db, get_db, init_db
 from app.artifacts import router as artifacts_router
 from app.logging_utils import configure_logging, get_logger, log_event, log_task_transition
+from app.limits import (
+    FETCH_DOMAIN_ALLOWLIST,
+    MAX_BATCH_SIZE,
+    SEARCH_SOURCE_ALLOWLIST,
+    TASK_MAX_ARTIFACT_MB,
+    TASK_MAX_RUNTIME_SECONDS,
+    TASKS_PER_MINUTE,
+    rate_limit_check,
+)
 from app.models import Task
 from app.queue import enqueue_task, get_redis, WORKER_HEARTBEAT_KEY
 from app.storage import ensure_bucket, get_client
@@ -71,6 +80,16 @@ def create_task_record(
     timeout_seconds: int,
     max_retries: int,
 ) -> TaskCreateResponse:
+    allowed, current = rate_limit_check()
+    if not allowed:
+        log_event(
+            logger,
+            "rate_limit_exceeded",
+            reason="rate_limit_exceeded",
+            limit=TASKS_PER_MINUTE,
+            current=current,
+        )
+        raise HTTPException(status_code=429, detail="rate_limit_exceeded")
     if task_type not in {"echo", "sleep", "search"}:
         raise HTTPException(status_code=400, detail="unsupported task type")
 
@@ -83,6 +102,10 @@ def create_task_record(
         query = params.get("query")
         if query is None or not isinstance(query, str) or not query.strip():
             raise HTTPException(status_code=400, detail="search requires params.query as a non-empty string")
+        sources = params.get("sources") or ["brave"]
+        if not isinstance(sources, list) or not sources:
+            log_event(logger, "task_rejected_invalid_params", reason="search_sources_invalid")
+            raise HTTPException(status_code=400, detail="search requires params.sources as a non-empty list")
 
     if idempotency_key:
         existing = (
@@ -221,3 +244,15 @@ def health() -> Dict[str, Any]:
         db_status = "down"
 
     return {"ok": redis_status == "ok" and db_status == "ok", "redis": redis_status, "db": db_status, "worker": worker_status}
+
+
+@app.get("/limits")
+def get_limits() -> Dict[str, Any]:
+    return {
+        "task_max_runtime_seconds": TASK_MAX_RUNTIME_SECONDS,
+        "task_max_artifact_mb": TASK_MAX_ARTIFACT_MB,
+        "tasks_per_minute": TASKS_PER_MINUTE,
+        "search_source_allowlist": SEARCH_SOURCE_ALLOWLIST,
+        "fetch_domain_allowlist": FETCH_DOMAIN_ALLOWLIST,
+        "max_batch_size": MAX_BATCH_SIZE,
+    }

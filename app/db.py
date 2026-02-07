@@ -8,7 +8,7 @@ from alembic.script import ScriptDirectory
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import declarative_base, sessionmaker
 
-from app.logging_utils import get_logger, log_event
+from app.logging_utils import configure_logging, get_logger, log_event
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
@@ -63,6 +63,8 @@ def run_migrations() -> None:
         to_revision=new_rev,
         head_revision=head_rev,
     )
+    # Alembic logging can override app logging config; re-apply ours.
+    configure_logging()
 
 
 def init_db() -> None:

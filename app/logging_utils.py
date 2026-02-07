@@ -64,7 +64,13 @@ def get_logger(name: str) -> logging.Logger:
 
 
 def log_event(logger: logging.Logger, event: str, **fields: Any) -> None:
-    logger.info(event, extra={"event": event, **fields})
+    safe_fields: Dict[str, Any] = {}
+    for key, value in fields.items():
+        if key in STANDARD_ATTRS:
+            safe_fields[f"field_{key}"] = value
+        else:
+            safe_fields[key] = value
+    logger.info(event, extra={"event": event, **safe_fields})
 
 
 def log_task_transition(

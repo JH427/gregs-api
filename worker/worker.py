@@ -19,6 +19,7 @@ from app.db_helpers import (
     update_run_status,
 )
 from app.logging_utils import configure_logging, get_logger, log_event, log_task_transition
+from app.limits import SEARCH_SOURCE_ALLOWLIST, TASK_MAX_RUNTIME_SECONDS
 from app.models import Task
 from app.queue import (
     PROCESSING_NAME,
@@ -168,9 +169,19 @@ def execute_task(db: Session, task: Task) -> bool:
 
     run = create_run(db, run_key=processing_key, metadata_json={"task_id": task.id, "task_type": task.type})
     try:
+        if time.time() - start_time > TASK_MAX_RUNTIME_SECONDS:
+            log_event(logger, "task_killed", task_id=task.id, reason="runtime_limit", limit=TASK_MAX_RUNTIME_SECONDS)
+            mark_failed(db, task, "task_runtime_exceeded")
+            update_run_status(db, run, "failed")
+            return False
         if task.type == "echo":
             if time.time() - start_time > task.timeout_seconds:
                 raise TimeoutError("task timed out")
+            if time.time() - start_time > TASK_MAX_RUNTIME_SECONDS:
+                log_event(logger, "task_killed", task_id=task.id, reason="runtime_limit", limit=TASK_MAX_RUNTIME_SECONDS)
+                mark_failed(db, task, "task_runtime_exceeded")
+                update_run_status(db, run, "failed")
+                return False
             task = refresh_task(db, task)
             if task.cancel_requested:
                 mark_cancelled(db, task)
@@ -211,6 +222,11 @@ def execute_task(db: Session, task: Task) -> bool:
                         task_id=task.id,
                     )
                     return False
+                if time.time() - start_time > TASK_MAX_RUNTIME_SECONDS:
+                    log_event(logger, "task_killed", task_id=task.id, reason="runtime_limit", limit=TASK_MAX_RUNTIME_SECONDS)
+                    mark_failed(db, task, "task_runtime_exceeded")
+                    update_run_status(db, run, "failed")
+                    return False
                 if time.time() - start_time > task.timeout_seconds:
                     raise TimeoutError("task timed out")
                 time.sleep(1)
@@ -240,11 +256,41 @@ def execute_task(db: Session, task: Task) -> bool:
                     task_id=task.id,
                 )
                 return False
+            sources = (task.params_json.get("sources") or ["brave"])
+            if not isinstance(sources, list) or any(source.lower() not in SEARCH_SOURCE_ALLOWLIST for source in sources):
+                log_event(
+                    logger,
+                    "task_rejected_invalid_params",
+                    task_id=task.id,
+                    reason="search_source_not_allowed",
+                    allowlist=SEARCH_SOURCE_ALLOWLIST,
+                )
+                mark_failed(db, task, "task_rejected_invalid_params")
+                update_run_status(db, run, "failed")
+                return False
+            if time.time() - start_time > TASK_MAX_RUNTIME_SECONDS:
+                log_event(logger, "task_killed", task_id=task.id, reason="runtime_limit", limit=TASK_MAX_RUNTIME_SECONDS)
+                mark_failed(db, task, "task_runtime_exceeded")
+                update_run_status(db, run, "failed")
+                return False
             redis_client = connect_redis()
             result = run_search_task(db, task.id, task.params_json, redis_client, logger)
+            if time.time() - start_time > TASK_MAX_RUNTIME_SECONDS:
+                log_event(logger, "task_killed", task_id=task.id, reason="runtime_limit", limit=TASK_MAX_RUNTIME_SECONDS)
+                mark_failed(db, task, "task_runtime_exceeded")
+                update_run_status(db, run, "failed")
+                return False
             task = refresh_task(db, task)
             if task.cancel_requested:
                 mark_cancelled(db, task)
+                update_run_status(db, run, "failed")
+                create_metric(
+                    db,
+                    name="duration_ms",
+                    value=int((time.time() - start_time) * 1000),
+                    run_id=run.id,
+                    task_id=task.id,
+                )
                 return False
         else:
             raise ValueError("unsupported task type")

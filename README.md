@@ -165,3 +165,23 @@ docker compose exec -T api curl -s http://127.0.0.1:8000/artifacts/<artifact_id>
 ```bash
 make smoke
 ```
+
+## Phase 7 — Safety & Limits
+Limits are enforced centrally and read once at startup from environment variables.
+
+Defaults (override via env):
+- `TASK_MAX_RUNTIME_SECONDS=600`
+- `TASK_MAX_ARTIFACT_MB=25`
+- `TASKS_PER_MINUTE=30`
+- `SEARCH_SOURCE_ALLOWLIST=brave`
+- `FETCH_DOMAIN_ALLOWLIST=*`
+- `MAX_BATCH_SIZE=50`
+
+Enforcement:
+- Worker kills tasks exceeding runtime (error: `task_runtime_exceeded`, log event `task_killed`).
+- Artifacts exceeding size limit are rejected (error: `artifact_size_exceeded`, log event `artifact_rejected`).
+- Search sources not in allowlist are rejected (`task_rejected_invalid_params`).
+- Enqueue is rate limited (HTTP 429, `rate_limit_exceeded`).
+
+Limits introspection:
+- `GET /limits` returns the effective limits.
