@@ -12,6 +12,8 @@ FastAPI API + worker + Redis queue + PostgreSQL persistence + Search Aggregator 
 - `app/cache.py` Search cache helpers
 - `app/search.py` Search task logic + provider adapter
 - `app/fetch.py` Fetch task logic + reader extraction + cache
+- `app/imports.py` Import staging + parsing helpers
+- `app/knowledge/` Domain, chunking, embedding, Qdrant, and promotion helpers
 - `app/artifacts.py` Artifact API + DB helpers
 - `app/storage.py` MinIO client helpers
 - `app/logging_utils.py` JSON logging helpers
@@ -66,6 +68,15 @@ Search:
 Fetch:
 - `FETCH_CACHE_TTL_SECONDS` (default `3600`)
 - `FETCH_DOMAIN_ALLOWLIST` (default `*`)
+
+Imports:
+- `MAX_IMPORT_FILE_MB` (default `50`)
+
+Knowledge Promotion:
+- `EMBEDDING_MODEL_DEFAULT` (default `intfloat/e5-small`)
+- `CHUNK_SIZE` (default `800`)
+- `CHUNK_OVERLAP` (default `120`)
+- `QDRANT_URL` (default `http://qdrant:6333`)
 
 MinIO:
 - `MINIO_ROOT_USER`
@@ -175,6 +186,66 @@ docker compose exec -T api curl -s -X POST http://127.0.0.1:8000/fetch \
   -d '{"url":"https://example.com/article","reader_mode":true,"store_raw_html":true}'
 ```
 
+## Phase 9A — Imports (Artifacts Only)
+Phase 9A keeps imports artifact-first. Raw inputs are preserved, parsed artifacts are derived and traceable, and this phase does not add embeddings, vector storage, summarization, classification, or promotion.
+
+Behavior:
+- `POST /import/files` accepts PDF, TXT, and MD uploads and queues an async import task.
+- PDFs are parsed with MarkItDown into Markdown artifacts.
+- TXT and MD files are read directly as UTF-8 text.
+- `POST /import/chatgpt` ingests ChatGPT export JSON and preserves per-conversation structure.
+- All successful imports emit `import_raw`, parsed artifacts, and `import_metadata`; handled failures emit `import_error`.
+
+Upload a file:
+```bash
+docker compose exec -T api curl -s -X POST http://127.0.0.1:8000/import/files \
+  -F 'file=@/tmp/sample.pdf'
+```
+
+Upload a ChatGPT export:
+```bash
+docker compose exec -T api curl -s -X POST http://127.0.0.1:8000/import/chatgpt \
+  -H 'Content-Type: application/json' \
+  --data-binary @/tmp/chatgpt-export.json
+```
+
+Poll the queued task:
+```bash
+docker compose exec -T api curl -s http://127.0.0.1:8000/tasks/<task_id>
+```
+
+## Phase 9B — Knowledge Promotion
+Phase 9B promotes existing artifacts into domain-scoped vector memory. Promotion is explicit, embeddings are created only during promotion, Qdrant stays on the private Docker network, and BELIEF promotion is blocked in this phase.
+
+Behavior:
+- `POST /knowledge/promote` queues an async promotion task.
+- Promotion resolves text from an existing artifact, chunks it deterministically, embeds it locally on CPU, and stores vectors in Qdrant.
+- Postgres stores promotion metadata and chunk references, while chunk text itself stays in artifacts.
+- The same artifact plus the same model and chunk config dedupes via `promotion_key` instead of re-embedding.
+
+Promote an artifact:
+```bash
+docker compose exec -T api curl -s -X POST http://127.0.0.1:8000/knowledge/promote \
+  -H 'Content-Type: application/json' \
+  -d '{"artifact_id":"<artifact_id>","domain":"project","source":"files","confidence":"medium"}'
+```
+
+## Phase 9C — Knowledge Query
+Phase 9C queries promoted knowledge asynchronously and remains artifact-first. One artifact contains ranked results, and a second audit artifact records the searched domains, routing behavior, filters, and scoring decisions that produced those results.
+
+Behavior:
+- `POST /knowledge/query` queues an async query task.
+- Explicit domains override the router; omitted domains trigger a deterministic rules-only router.
+- Results are merged across searched domains with precedence weighting and optional prefer boosts.
+- Zero-result queries still succeed and still create both artifacts.
+
+Query promoted knowledge:
+```bash
+docker compose exec -T api curl -s -X POST http://127.0.0.1:8000/knowledge/query \
+  -H 'Content-Type: application/json' \
+  -d '{"query":"Brave batch is failing, what was the decision?","domains":["ops","project"],"domain_mode":"prefer","top_k_per_domain":5}'
+```
+
 Create an artifact (JSON + base64):
 ```bash
 docker compose exec -T api curl -s -X POST http://127.0.0.1:8000/artifacts \
@@ -207,6 +278,18 @@ docker compose exec -T api curl -s http://127.0.0.1:8000/artifacts/<artifact_id>
 make smoke
 ```
 
+```bash
+make smoke-imports
+```
+
+```bash
+make smoke-knowledge
+```
+
+```bash
+make smoke-query
+```
+
 ## Phase 7 — Safety & Limits
 Limits are enforced centrally and read once at startup from environment variables.
 
@@ -217,6 +300,12 @@ Defaults (override via env):
 - `SEARCH_SOURCE_ALLOWLIST=brave`
 - `FETCH_DOMAIN_ALLOWLIST=*`
 - `MAX_BATCH_SIZE=50`
+- `MAX_IMPORT_FILE_MB=50`
+- `EMBEDDING_MODEL_DEFAULT=intfloat/e5-small`
+- `CHUNK_SIZE=800`
+- `CHUNK_OVERLAP=120`
+- `TOP_K_PER_DOMAIN=5`
+- `KNOWLEDGE_QUERY_MAX_DOMAINS=6`
 
 Enforcement:
 - Worker kills tasks exceeding runtime (error: `task_runtime_exceeded`, log event `task_killed`).

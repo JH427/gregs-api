@@ -20,6 +20,7 @@ from app.db_helpers import (
 )
 from app.logging_utils import configure_logging, get_logger, log_event, log_task_transition
 from app.limits import (
+    EMBEDDING_MODEL_DEFAULT,
     MAX_BATCH_SIZE,
     SEARCH_SOURCE_ALLOWLIST,
     TASK_MAX_RUNTIME_SECONDS,
@@ -28,13 +29,14 @@ from app.limits import (
 )
 from app.models import Task
 from app.queue import (
-    PROCESSING_NAME,
-    QUEUE_NAME,
     ack_processing,
     ack_task,
     dequeue_task,
     ensure_enqueued,
+    get_processing_name,
+    get_queue_for_task,
     get_redis,
+    get_queue_set,
     requeue_inflight,
     update_worker_heartbeat,
 )
@@ -48,14 +50,24 @@ from app.search import (
     run_search_task,
 )
 from app.fetch import normalize_fetch_params, run_fetch_task
+from app.imports import run_import_chatgpt_task, run_import_file_task
+from app.knowledge.embeddings import get_sentence_transformers_provider
+from app.knowledge.query import run_knowledge_query_task
+from app.knowledge.promotion import run_knowledge_promote_task
 from app.storage import ensure_bucket, get_client
 
 POLL_TIMEOUT = int(os.getenv("WORKER_POLL_TIMEOUT", "5"))
 REDIS_RETRY_DELAY = float(os.getenv("REDIS_RETRY_DELAY", "2"))
 RECONCILE_INTERVAL = float(os.getenv("QUEUE_RECONCILE_INTERVAL", "10"))
+WORKER_QUEUE = os.getenv("WORKER_QUEUE", "queue_query")
+VALID_WORKER_QUEUES = {"queue_query", "queue_promote"}
 
 configure_logging()
 logger = get_logger("worker")
+
+
+def task_belongs_to_worker(task: Task) -> bool:
+    return get_queue_for_task(task.type) == WORKER_QUEUE
 
 
 def heartbeat_loop() -> None:
@@ -65,6 +77,60 @@ def heartbeat_loop() -> None:
         except Exception:
             pass
         time.sleep(5)
+
+
+def preload_embedding_provider() -> None:
+    started_at = time.time()
+    log_event(logger, "embedding_model_load_started", model_name=EMBEDDING_MODEL_DEFAULT)
+    try:
+        provider = get_sentence_transformers_provider(EMBEDDING_MODEL_DEFAULT)
+    except Exception as exc:
+        log_event(
+            logger,
+            "embedding_model_load_failed",
+            model_name=EMBEDDING_MODEL_DEFAULT,
+            elapsed_seconds=round(time.time() - started_at, 3),
+            error=str(exc),
+        )
+        return
+    load_elapsed = round(time.time() - started_at, 3)
+    log_event(
+        logger,
+        "embedding_model_load_completed",
+        model_name=EMBEDDING_MODEL_DEFAULT,
+        embedding_revision=provider.embedding_revision,
+        elapsed_seconds=load_elapsed,
+    )
+    warmup_started_at = time.time()
+    log_event(logger, "embedding_model_warmup_started", model_name=EMBEDDING_MODEL_DEFAULT)
+    try:
+        provider.embed(["warmup"])
+    except Exception as exc:
+        log_event(
+            logger,
+            "embedding_model_warmup_failed",
+            model_name=EMBEDDING_MODEL_DEFAULT,
+            embedding_revision=provider.embedding_revision,
+            elapsed_seconds=round(time.time() - warmup_started_at, 3),
+            error=str(exc),
+        )
+        return
+    warmup_elapsed = round(time.time() - warmup_started_at, 3)
+    log_event(
+        logger,
+        "embedding_model_warmup_completed",
+        model_name=EMBEDDING_MODEL_DEFAULT,
+        embedding_revision=provider.embedding_revision,
+        elapsed_seconds=warmup_elapsed,
+    )
+    log_event(
+        logger,
+        "embedding_provider_ready",
+        model_name=EMBEDDING_MODEL_DEFAULT,
+        embedding_revision=provider.embedding_revision,
+        load_elapsed_seconds=load_elapsed,
+        warmup_elapsed_seconds=warmup_elapsed,
+    )
 
 
 def transition_status(db: Session, task: Task, to_status: str, **fields) -> None:
@@ -98,12 +164,20 @@ def connect_redis() -> redis.Redis:
 
 
 def recover_queue_state(r: redis.Redis, db: Session) -> None:
-    moved = requeue_inflight(r)
+    moved = requeue_inflight(r, WORKER_QUEUE)
     if moved:
-        log_event(logger, "requeued_inflight", count=moved, from_queue=PROCESSING_NAME, to_queue=QUEUE_NAME)
+        log_event(
+            logger,
+            "requeued_inflight",
+            count=moved,
+            from_queue=get_processing_name(WORKER_QUEUE),
+            to_queue=WORKER_QUEUE,
+        )
 
     running = db.query(Task).filter(Task.status == "running").all()
     for task in running:
+        if not task_belongs_to_worker(task):
+            continue
         from_status = task.status
         task.status = "queued"
         task.started_at = None
@@ -113,13 +187,17 @@ def recover_queue_state(r: redis.Redis, db: Session) -> None:
 
     queued = db.query(Task).filter(Task.status == "queued").all()
     for task in queued:
-        ensure_enqueued(r, task.id)
+        if not task_belongs_to_worker(task):
+            continue
+        ensure_enqueued(r, task.id, task.type)
 
 
 def ensure_queued_tasks(r: redis.Redis, db: Session) -> None:
     queued = db.query(Task).filter(Task.status == "queued").all()
     for task in queued:
-        ensure_enqueued(r, task.id)
+        if not task_belongs_to_worker(task):
+            continue
+        ensure_enqueued(r, task.id, task.type)
 
 
 def refresh_task(db: Session, task: Task) -> Task:
@@ -143,6 +221,22 @@ def _normalize_params_for_task(task: Task) -> dict:
             return normalize_fetch_params(task.params_json)
         except Exception:
             return task.params_json or {}
+    if task.type == "import_file":
+        return {
+            "source": task.params_json.get("source"),
+            "filename": task.params_json.get("filename"),
+            "mime": task.params_json.get("mime"),
+            "sha256": task.params_json.get("sha256"),
+        }
+    if task.type == "import_chatgpt":
+        return {
+            "source": task.params_json.get("source"),
+            "sha256": task.params_json.get("sha256"),
+        }
+    if task.type == "knowledge_promote":
+        return {"task_id": task.id}
+    if task.type == "knowledge_query":
+        return {"task_id": task.id}
     if task.type == "sleep":
         return {"seconds": int(task.params_json.get("seconds", 0))}
     return task.params_json or {}
@@ -519,6 +613,79 @@ def execute_task(db: Session, task: Task) -> bool:
                     task_id=task.id,
                 )
                 return False
+        elif task.type == "import_file":
+            task = refresh_task(db, task)
+            if task.cancel_requested:
+                mark_cancelled(db, task)
+                update_run_status(db, run, "failed")
+                create_metric(
+                    db,
+                    name="duration_ms",
+                    value=int((time.time() - start_time) * 1000),
+                    run_id=run.id,
+                    task_id=task.id,
+                )
+                return False
+            result = run_import_file_task(db, task.id, task.params_json, logger)
+        elif task.type == "import_chatgpt":
+            task = refresh_task(db, task)
+            if task.cancel_requested:
+                mark_cancelled(db, task)
+                update_run_status(db, run, "failed")
+                create_metric(
+                    db,
+                    name="duration_ms",
+                    value=int((time.time() - start_time) * 1000),
+                    run_id=run.id,
+                    task_id=task.id,
+                )
+                return False
+            result = run_import_chatgpt_task(db, task.id, task.params_json, logger)
+        elif task.type == "knowledge_promote":
+            task = refresh_task(db, task)
+            if task.cancel_requested:
+                mark_cancelled(db, task)
+                update_run_status(db, run, "failed")
+                create_metric(
+                    db,
+                    name="duration_ms",
+                    value=int((time.time() - start_time) * 1000),
+                    run_id=run.id,
+                    task_id=task.id,
+                )
+                return False
+            try:
+                result = run_knowledge_promote_task(db, task.id, task.params_json, logger)
+            except TaskCancelled:
+                mark_cancelled(db, task)
+                update_run_status(db, run, "failed")
+                create_metric(
+                    db,
+                    name="duration_ms",
+                    value=int((time.time() - start_time) * 1000),
+                    run_id=run.id,
+                    task_id=task.id,
+                )
+                return False
+            except TaskRuntimeExceeded as exc:
+                log_event(logger, "task_killed", task_id=task.id, reason="runtime_limit", detail=str(exc))
+                mark_failed(db, task, str(exc))
+                update_run_status(db, run, "failed")
+                return False
+        elif task.type == "knowledge_query":
+            task = refresh_task(db, task)
+            if task.cancel_requested:
+                mark_cancelled(db, task)
+                update_run_status(db, run, "failed")
+                create_metric(
+                    db,
+                    name="duration_ms",
+                    value=int((time.time() - start_time) * 1000),
+                    run_id=run.id,
+                    task_id=task.id,
+                )
+                return False
+            result = run_knowledge_query_task(db, task.id, task.params_json, logger)
         else:
             raise ValueError("unsupported task type")
 
@@ -555,7 +722,7 @@ def execute_task(db: Session, task: Task) -> bool:
                 error=str(exc),
             )
             r = connect_redis()
-            ensure_enqueued(r, task.id)
+            ensure_enqueued(r, task.id, task.type)
             update_run_status(db, run, "failed")
             create_metric(
                 db,
@@ -579,8 +746,17 @@ def execute_task(db: Session, task: Task) -> bool:
 
 
 def main() -> None:
+    if WORKER_QUEUE not in VALID_WORKER_QUEUES:
+        raise ValueError(f"unsupported WORKER_QUEUE: {WORKER_QUEUE}")
     init_db()
-    log_event(logger, "worker_startup")
+    log_event(
+        logger,
+        "worker_startup",
+        queue=WORKER_QUEUE,
+        processing_queue=get_processing_name(WORKER_QUEUE),
+        queue_set=get_queue_set(WORKER_QUEUE),
+    )
+    preload_embedding_provider()
 
     t = threading.Thread(target=heartbeat_loop, daemon=True)
     t.start()
@@ -600,7 +776,7 @@ def main() -> None:
     last_reconcile = 0.0
     while True:
         try:
-            task_id: Optional[str] = dequeue_task(r, POLL_TIMEOUT)
+            task_id: Optional[str] = dequeue_task(r, POLL_TIMEOUT, WORKER_QUEUE)
         except Exception as exc:
             log_event(logger, "redis_error", error=str(exc))
             r = connect_redis()
@@ -622,35 +798,54 @@ def main() -> None:
                 last_reconcile = now
             continue
 
+        log_event(logger, "task_dequeued", task_id=task_id, queue=WORKER_QUEUE)
+
         db = SessionLocal()
         try:
             task = db.query(Task).filter(Task.id == task_id).first()
             if not task:
                 try:
-                    ack_task(r, task_id)
+                    ack_task(r, task_id, WORKER_QUEUE)
                 except Exception:
                     r = connect_redis()
-                    ack_task(r, task_id)
+                    ack_task(r, task_id, WORKER_QUEUE)
+                continue
+            if not task_belongs_to_worker(task):
+                log_event(
+                    logger,
+                    "task_wrong_queue",
+                    task_id=task.id,
+                    task_type=task.type,
+                    worker_queue=WORKER_QUEUE,
+                    expected_queue=get_queue_for_task(task.type),
+                )
+                try:
+                    ack_task(r, task_id, WORKER_QUEUE)
+                    ensure_enqueued(r, task.id, task.type)
+                except Exception:
+                    r = connect_redis()
+                    ack_task(r, task_id, WORKER_QUEUE)
+                    ensure_enqueued(r, task.id, task.type)
                 continue
             if task.status != "queued":
                 try:
-                    ack_task(r, task_id)
+                    ack_task(r, task_id, WORKER_QUEUE)
                 except Exception:
                     r = connect_redis()
-                    ack_task(r, task_id)
+                    ack_task(r, task_id, WORKER_QUEUE)
                 continue
             requeued = execute_task(db, task)
             try:
                 if requeued:
-                    ack_processing(r, task_id)
+                    ack_processing(r, task_id, WORKER_QUEUE)
                 else:
-                    ack_task(r, task_id)
+                    ack_task(r, task_id, WORKER_QUEUE)
             except Exception:
                 r = connect_redis()
                 if requeued:
-                    ack_processing(r, task_id)
+                    ack_processing(r, task_id, WORKER_QUEUE)
                 else:
-                    ack_task(r, task_id)
+                    ack_task(r, task_id, WORKER_QUEUE)
         finally:
             db.close()
 
