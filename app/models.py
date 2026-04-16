@@ -38,6 +38,7 @@ class Artifact(Base):
     type = Column(String, nullable=False, index=True)
     content_type = Column(String, nullable=False)
     path = Column(String, nullable=False)
+    metadata_json = Column(JSONB, nullable=True)
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
 
 
@@ -72,3 +73,31 @@ class Note(Base):
     type = Column(String, nullable=False, index=True)
     content = Column(Text, nullable=False)
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+
+
+class KnowledgeDocument(Base):
+    __tablename__ = "knowledge_documents"
+
+    id = Column(String, primary_key=True, index=True)
+    artifact_id = Column(String, nullable=False, index=True)
+    domain = Column(String, nullable=False, index=True)
+    source = Column(String, nullable=True)
+    confidence = Column(String, nullable=True)
+    promotion_key = Column(String, nullable=False, unique=True, index=True)
+    embedding_model = Column(String, nullable=False)
+    embedding_revision = Column(String, nullable=False)
+    chunker_version = Column(String, nullable=False)
+    chunk_params = Column(JSONB, nullable=False, default=dict)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=datetime.utcnow)
+    promoted_at = Column(DateTime(timezone=True), nullable=True)
+
+
+class KnowledgeChunk(Base):
+    __tablename__ = "knowledge_chunks"
+
+    id = Column(String, primary_key=True, index=True)
+    document_id = Column(String, ForeignKey("knowledge_documents.id"), nullable=False, index=True)
+    chunk_index = Column(Integer, nullable=False)
+    qdrant_point_id = Column(String, nullable=False)
+    text_artifact_id = Column(String, nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=datetime.utcnow)

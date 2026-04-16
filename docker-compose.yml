@@ -17,6 +17,18 @@ services:
     networks:
       - private
 
+  qdrant:
+    image: qdrant/qdrant:v1.12.6
+    volumes:
+      - /mnt/data/qdrant:/qdrant/storage
+    networks:
+      - private
+    restart: always
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+
   minio:
     image: minio/minio:latest
     command: ["server", "/data", "--console-address", ":9001"]
@@ -53,6 +65,8 @@ services:
     command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--log-config", "/app/app/logging_config.json"]
     ports:
       - "127.0.0.1:8000:8000"
+    volumes:
+      - /mnt/data/hf_cache:/mnt/data/hf_cache
     environment:
       REDIS_URL: redis://redis:6379/0
       DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg2://api:api@postgres:5432/api}
@@ -66,6 +80,23 @@ services:
       SEARCH_MAX_RESULTS: ${SEARCH_MAX_RESULTS:-10}
       FETCH_CACHE_TTL_SECONDS: ${FETCH_CACHE_TTL_SECONDS:-3600}
       FETCH_DOMAIN_ALLOWLIST: ${FETCH_DOMAIN_ALLOWLIST:-*}
+      EMBEDDING_MODEL_DEFAULT: ${EMBEDDING_MODEL_DEFAULT:-intfloat/e5-small-v2}
+      HF_HOME: ${HF_HOME:-/mnt/data/hf_cache}
+      HUGGINGFACE_HUB_CACHE: ${HUGGINGFACE_HUB_CACHE:-/mnt/data/hf_cache/hub}
+      TRANSFORMERS_CACHE: ${TRANSFORMERS_CACHE:-/mnt/data/hf_cache/transformers}
+      SENTENCE_TRANSFORMERS_HOME: ${SENTENCE_TRANSFORMERS_HOME:-/mnt/data/hf_cache/sentence_transformers}
+      CHUNK_SIZE: ${CHUNK_SIZE:-800}
+      CHUNK_OVERLAP: ${CHUNK_OVERLAP:-120}
+      TOP_K_PER_DOMAIN: ${TOP_K_PER_DOMAIN:-5}
+      KNOWLEDGE_QUERY_MAX_DOMAINS: ${KNOWLEDGE_QUERY_MAX_DOMAINS:-6}
+      KNOWLEDGE_PROMOTION_MAX_INPUT_BYTES: ${KNOWLEDGE_PROMOTION_MAX_INPUT_BYTES:-262144}
+      KNOWLEDGE_PROMOTION_MAX_CHUNKS: ${KNOWLEDGE_PROMOTION_MAX_CHUNKS:-256}
+      KNOWLEDGE_PROMOTION_EMBED_BATCH_SIZE: ${KNOWLEDGE_PROMOTION_EMBED_BATCH_SIZE:-16}
+      KNOWLEDGE_PROMOTION_UPSERT_BATCH_SIZE: ${KNOWLEDGE_PROMOTION_UPSERT_BATCH_SIZE:-64}
+      KNOWLEDGE_PROMOTION_MODEL_INIT_TIMEOUT_SECONDS: ${KNOWLEDGE_PROMOTION_MODEL_INIT_TIMEOUT_SECONDS:-60}
+      QDRANT_URL: ${QDRANT_URL:-http://qdrant:6333}
+      QDRANT_TIMEOUT_SECONDS: ${QDRANT_TIMEOUT_SECONDS:-10}
+      QDRANT_HEALTH_TIMEOUT_SECONDS: ${QDRANT_HEALTH_TIMEOUT_SECONDS:-2}
       MINIO_ENDPOINT: ${MINIO_ENDPOINT:-minio:9000}
       MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
       MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
@@ -74,14 +105,18 @@ services:
     depends_on:
       - redis
       - postgres
+      - qdrant
       - minio
       - minio-init
     networks:
       - private
+    restart: always
 
-  worker:
+  worker_query:
     build: .
     command: ["python", "-m", "worker.worker"]
+    volumes:
+      - /mnt/data/hf_cache:/mnt/data/hf_cache
     environment:
       REDIS_URL: redis://redis:6379/0
       DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg2://api:api@postgres:5432/api}
@@ -95,14 +130,84 @@ services:
       SEARCH_MAX_RESULTS: ${SEARCH_MAX_RESULTS:-10}
       FETCH_CACHE_TTL_SECONDS: ${FETCH_CACHE_TTL_SECONDS:-3600}
       FETCH_DOMAIN_ALLOWLIST: ${FETCH_DOMAIN_ALLOWLIST:-*}
+      EMBEDDING_MODEL_DEFAULT: ${EMBEDDING_MODEL_DEFAULT:-intfloat/e5-small-v2}
+      HF_HOME: ${HF_HOME:-/mnt/data/hf_cache}
+      HUGGINGFACE_HUB_CACHE: ${HUGGINGFACE_HUB_CACHE:-/mnt/data/hf_cache/hub}
+      TRANSFORMERS_CACHE: ${TRANSFORMERS_CACHE:-/mnt/data/hf_cache/transformers}
+      SENTENCE_TRANSFORMERS_HOME: ${SENTENCE_TRANSFORMERS_HOME:-/mnt/data/hf_cache/sentence_transformers}
+      CHUNK_SIZE: ${CHUNK_SIZE:-800}
+      CHUNK_OVERLAP: ${CHUNK_OVERLAP:-120}
+      TOP_K_PER_DOMAIN: ${TOP_K_PER_DOMAIN:-5}
+      KNOWLEDGE_QUERY_MAX_DOMAINS: ${KNOWLEDGE_QUERY_MAX_DOMAINS:-6}
+      KNOWLEDGE_PROMOTION_MAX_INPUT_BYTES: ${KNOWLEDGE_PROMOTION_MAX_INPUT_BYTES:-262144}
+      KNOWLEDGE_PROMOTION_MAX_CHUNKS: ${KNOWLEDGE_PROMOTION_MAX_CHUNKS:-256}
+      KNOWLEDGE_PROMOTION_EMBED_BATCH_SIZE: ${KNOWLEDGE_PROMOTION_EMBED_BATCH_SIZE:-16}
+      KNOWLEDGE_PROMOTION_UPSERT_BATCH_SIZE: ${KNOWLEDGE_PROMOTION_UPSERT_BATCH_SIZE:-64}
+      KNOWLEDGE_PROMOTION_MODEL_INIT_TIMEOUT_SECONDS: ${KNOWLEDGE_PROMOTION_MODEL_INIT_TIMEOUT_SECONDS:-60}
+      QDRANT_URL: ${QDRANT_URL:-http://qdrant:6333}
+      QDRANT_TIMEOUT_SECONDS: ${QDRANT_TIMEOUT_SECONDS:-10}
+      QDRANT_HEALTH_TIMEOUT_SECONDS: ${QDRANT_HEALTH_TIMEOUT_SECONDS:-2}
       MINIO_ENDPOINT: ${MINIO_ENDPOINT:-minio:9000}
       MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
       MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
       MINIO_BUCKET: ${MINIO_BUCKET:-artifacts}
       MINIO_SECURE: ${MINIO_SECURE:-false}
+      WORKER_QUEUE: queue_query
     depends_on:
       - redis
       - postgres
+      - qdrant
+      - minio
+      - minio-init
+    networks:
+      - private
+    restart: always
+
+  worker_promote:
+    build: .
+    command: ["python", "-m", "worker.worker"]
+    volumes:
+      - /mnt/data/hf_cache:/mnt/data/hf_cache
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg2://api:api@postgres:5432/api}
+      LOG_CONFIG: /app/app/logging_config.json
+      BRAVE_API_KEY: ${BRAVE_API_KEY}
+      BRAVE_API_URL: ${BRAVE_API_URL:-https://api.search.brave.com/res/v1/web/search}
+      EXA_API_KEY: ${EXA_API_KEY}
+      EXA_API_URL: ${EXA_API_URL:-https://api.exa.ai/search}
+      SEARCH_SOURCE_ALLOWLIST: ${SEARCH_SOURCE_ALLOWLIST:-brave}
+      SEARCH_CACHE_TTL_SECONDS: ${SEARCH_CACHE_TTL_SECONDS:-3600}
+      SEARCH_MAX_RESULTS: ${SEARCH_MAX_RESULTS:-10}
+      FETCH_CACHE_TTL_SECONDS: ${FETCH_CACHE_TTL_SECONDS:-3600}
+      FETCH_DOMAIN_ALLOWLIST: ${FETCH_DOMAIN_ALLOWLIST:-*}
+      EMBEDDING_MODEL_DEFAULT: ${EMBEDDING_MODEL_DEFAULT:-intfloat/e5-small-v2}
+      HF_HOME: ${HF_HOME:-/mnt/data/hf_cache}
+      HUGGINGFACE_HUB_CACHE: ${HUGGINGFACE_HUB_CACHE:-/mnt/data/hf_cache/hub}
+      TRANSFORMERS_CACHE: ${TRANSFORMERS_CACHE:-/mnt/data/hf_cache/transformers}
+      SENTENCE_TRANSFORMERS_HOME: ${SENTENCE_TRANSFORMERS_HOME:-/mnt/data/hf_cache/sentence_transformers}
+      CHUNK_SIZE: ${CHUNK_SIZE:-800}
+      CHUNK_OVERLAP: ${CHUNK_OVERLAP:-120}
+      TOP_K_PER_DOMAIN: ${TOP_K_PER_DOMAIN:-5}
+      KNOWLEDGE_QUERY_MAX_DOMAINS: ${KNOWLEDGE_QUERY_MAX_DOMAINS:-6}
+      KNOWLEDGE_PROMOTION_MAX_INPUT_BYTES: ${KNOWLEDGE_PROMOTION_MAX_INPUT_BYTES:-262144}
+      KNOWLEDGE_PROMOTION_MAX_CHUNKS: ${KNOWLEDGE_PROMOTION_MAX_CHUNKS:-256}
+      KNOWLEDGE_PROMOTION_EMBED_BATCH_SIZE: ${KNOWLEDGE_PROMOTION_EMBED_BATCH_SIZE:-16}
+      KNOWLEDGE_PROMOTION_UPSERT_BATCH_SIZE: ${KNOWLEDGE_PROMOTION_UPSERT_BATCH_SIZE:-64}
+      KNOWLEDGE_PROMOTION_MODEL_INIT_TIMEOUT_SECONDS: ${KNOWLEDGE_PROMOTION_MODEL_INIT_TIMEOUT_SECONDS:-60}
+      QDRANT_URL: ${QDRANT_URL:-http://qdrant:6333}
+      QDRANT_TIMEOUT_SECONDS: ${QDRANT_TIMEOUT_SECONDS:-10}
+      QDRANT_HEALTH_TIMEOUT_SECONDS: ${QDRANT_HEALTH_TIMEOUT_SECONDS:-2}
+      MINIO_ENDPOINT: ${MINIO_ENDPOINT:-minio:9000}
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      MINIO_BUCKET: ${MINIO_BUCKET:-artifacts}
+      MINIO_SECURE: ${MINIO_SECURE:-false}
+      WORKER_QUEUE: queue_promote
+    depends_on:
+      - redis
+      - postgres
+      - qdrant
       - minio
       - minio-init
     networks:

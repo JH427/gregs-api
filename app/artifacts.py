@@ -32,6 +32,7 @@ class ArtifactResponse(BaseModel):
     type: str
     content_type: str
     created_at: str
+    metadata: Optional[Dict[str, Any]] = None
 
 
 class ArtifactListItem(BaseModel):
@@ -41,6 +42,7 @@ class ArtifactListItem(BaseModel):
     content_type: str
     created_at: str
     size_bytes: Optional[int] = None
+    metadata: Optional[Dict[str, Any]] = None
 
 
 class ArtifactListResponse(BaseModel):
@@ -54,6 +56,7 @@ class ArtifactIndexItem(BaseModel):
     type: str
     content_type: str
     created_at: str
+    metadata: Optional[Dict[str, Any]] = None
 
 
 class ArtifactIndexResponse(BaseModel):
@@ -70,6 +73,7 @@ def create_artifact_record(
     artifact_type: str,
     content_type: str,
     data: bytes,
+    metadata: Optional[Dict[str, Any]] = None,
     event_logger=None,
 ) -> Artifact:
     size_mb = len(data) / (1024 * 1024)
@@ -100,6 +104,7 @@ def create_artifact_record(
         type=artifact_type,
         content_type=content_type,
         path=path,
+        metadata_json=metadata,
         created_at=datetime.utcnow(),
     )
     db.add(artifact)
@@ -129,6 +134,7 @@ def create_artifact(payload: ArtifactCreateRequest, db: Session = Depends(get_db
         type=artifact.type,
         content_type=artifact.content_type,
         created_at=artifact.created_at.isoformat() + "Z",
+        metadata=artifact.metadata_json,
     )
 
 
@@ -173,6 +179,7 @@ def get_artifact_metadata(artifact_id: str, db: Session = Depends(get_db)) -> Ar
         type=artifact.type,
         content_type=artifact.content_type,
         created_at=artifact.created_at.isoformat() + "Z",
+        metadata=artifact.metadata_json,
     )
 
 
@@ -206,6 +213,7 @@ def list_task_artifacts(task_id: str, db: Session = Depends(get_db)) -> Artifact
                 content_type=artifact.content_type,
                 created_at=artifact.created_at.isoformat() + "Z",
                 size_bytes=size_bytes,
+                metadata=artifact.metadata_json,
             )
         )
 
@@ -255,6 +263,7 @@ def list_artifacts(
             type=artifact.type,
             content_type=artifact.content_type,
             created_at=artifact.created_at.isoformat() + "Z",
+            metadata=artifact.metadata_json,
         )
         for artifact in artifacts
     ]

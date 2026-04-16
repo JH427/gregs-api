@@ -43,3 +43,7 @@ def get_object(client: Minio, path: str):
 
 def stat_object(client: Minio, path: str):
     return client.stat_object(MINIO_BUCKET, path)
+
+
+def delete_object(client: Minio, path: str) -> None:
+    client.remove_object(MINIO_BUCKET, path)

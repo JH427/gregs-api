@@ -3,8 +3,12 @@ uvicorn==0.27.1
 redis==5.0.3
 SQLAlchemy==2.0.27
 pydantic==2.6.1
+python-multipart==0.0.9
 minio==7.2.5
 alembic==1.13.1
 psycopg2-binary==2.9.9
 beautifulsoup4==4.12.3
 lxml==5.3.0
+markitdown[all]
+qdrant-client==1.12.1
+sentence-transformers==3.3.1
