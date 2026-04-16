@@ -1,6 +1,8 @@
-# Task Runner + Queue (Phase 4)
+# Task Runner + Knowledge API
 
-FastAPI API + worker + Redis queue + PostgreSQL persistence + Search Aggregator + MinIO artifact store.
+FastAPI API + Redis queues + PostgreSQL persistence + search/fetch tasks + MinIO artifacts + Qdrant-backed knowledge promotion/query workflows.
+
+The service is artifact-first: long-running work is queued, task outputs are stored as artifacts, and knowledge workflows promote selected artifacts into domain-scoped vector collections only when explicitly requested.
 
 ## Repo Layout
 - `app/main.py` FastAPI API
@@ -24,9 +26,12 @@ FastAPI API + worker + Redis queue + PostgreSQL persistence + Search Aggregator 
 - `docker-compose.yml` Local deployment
 - `Makefile` Convenience commands
 - `scripts/smoke.sh` Smoke tests
+- `scripts/smoke_imports.sh` Import smoke tests
+- `scripts/smoke_knowledge.sh` Knowledge promotion smoke tests
+- `scripts/smoke_query.sh` Knowledge query smoke tests
 
 ## Run Instructions
-1. Build and start services (includes Postgres):
+1. Build and start services:
    ```bash
    cd /home/adminuser/api
    make start
@@ -43,11 +48,14 @@ FastAPI API + worker + Redis queue + PostgreSQL persistence + Search Aggregator 
    ```
 
 Notes:
-- The API binds to `127.0.0.1` inside the container and is not published on the host.
+- The API is published on the host at `127.0.0.1:8000`.
 - PostgreSQL runs on the private Docker network only (no host ports).
 - PostgreSQL data is stored on the host at `/mnt/data/postgres`.
 - MinIO runs on the private Docker network only (no host ports).
-- For local testing, use `docker compose exec -T api ...` as shown above.
+- Qdrant runs on the private Docker network only (no host ports).
+- Qdrant data is stored on the host at `/mnt/data/qdrant`.
+- Hugging Face model/cache data is stored on the host at `/mnt/data/hf_cache`.
+- For local testing from inside the stack, use `docker compose exec -T api ...` as shown below.
 - Existing SQLite data is not migrated; Postgres starts empty.
 
 ## Configuration
@@ -73,10 +81,19 @@ Imports:
 - `MAX_IMPORT_FILE_MB` (default `50`)
 
 Knowledge Promotion:
-- `EMBEDDING_MODEL_DEFAULT` (default `intfloat/e5-small`)
+- `EMBEDDING_MODEL_DEFAULT` (default `intfloat/e5-small-v2`)
 - `CHUNK_SIZE` (default `800`)
 - `CHUNK_OVERLAP` (default `120`)
+- `TOP_K_PER_DOMAIN` (default `5`)
+- `KNOWLEDGE_QUERY_MAX_DOMAINS` (default `6`)
+- `KNOWLEDGE_PROMOTION_MAX_INPUT_BYTES` (default `262144`)
+- `KNOWLEDGE_PROMOTION_MAX_CHUNKS` (default `256`)
+- `KNOWLEDGE_PROMOTION_EMBED_BATCH_SIZE` (default `16`)
+- `KNOWLEDGE_PROMOTION_UPSERT_BATCH_SIZE` (default `64`)
+- `KNOWLEDGE_PROMOTION_MODEL_INIT_TIMEOUT_SECONDS` (default `60`)
 - `QDRANT_URL` (default `http://qdrant:6333`)
+- `QDRANT_TIMEOUT_SECONDS` (default `10`)
+- `QDRANT_HEALTH_TIMEOUT_SECONDS` (default `2`)
 
 MinIO:
 - `MINIO_ROOT_USER`
@@ -274,18 +291,22 @@ docker compose exec -T api curl -s http://127.0.0.1:8000/artifacts/<artifact_id>
 ```
 
 ## Smoke Tests
+Core task/search/fetch smoke:
 ```bash
 make smoke
 ```
 
+Import smoke:
 ```bash
 make smoke-imports
 ```
 
+Knowledge promotion smoke:
 ```bash
 make smoke-knowledge
 ```
 
+Knowledge query smoke:
 ```bash
 make smoke-query
 ```
@@ -301,15 +322,22 @@ Defaults (override via env):
 - `FETCH_DOMAIN_ALLOWLIST=*`
 - `MAX_BATCH_SIZE=50`
 - `MAX_IMPORT_FILE_MB=50`
-- `EMBEDDING_MODEL_DEFAULT=intfloat/e5-small`
+- `EMBEDDING_MODEL_DEFAULT=intfloat/e5-small-v2`
 - `CHUNK_SIZE=800`
 - `CHUNK_OVERLAP=120`
 - `TOP_K_PER_DOMAIN=5`
 - `KNOWLEDGE_QUERY_MAX_DOMAINS=6`
+- `KNOWLEDGE_PROMOTION_MAX_INPUT_BYTES=262144`
+- `KNOWLEDGE_PROMOTION_MAX_CHUNKS=256`
+- `KNOWLEDGE_PROMOTION_EMBED_BATCH_SIZE=16`
+- `KNOWLEDGE_PROMOTION_UPSERT_BATCH_SIZE=64`
+- `KNOWLEDGE_PROMOTION_MODEL_INIT_TIMEOUT_SECONDS=60`
 
 Enforcement:
 - Worker kills tasks exceeding runtime (error: `task_runtime_exceeded`, log event `task_killed`).
 - Artifacts exceeding size limit are rejected (error: `artifact_size_exceeded`, log event `artifact_rejected`).
+- Import uploads over `MAX_IMPORT_FILE_MB` are rejected before queueing.
+- Knowledge promotion rejects oversized inputs and excessive chunk counts before embedding.
 - Search sources not in allowlist are rejected (`task_rejected_invalid_params`).
 - Enqueue is rate limited (HTTP 429, `rate_limit_exceeded`).
 
