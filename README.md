@@ -29,6 +29,9 @@ The service is artifact-first: long-running work is queued, task outputs are sto
 - `scripts/smoke_imports.sh` Import smoke tests
 - `scripts/smoke_knowledge.sh` Knowledge promotion smoke tests
 - `scripts/smoke_query.sh` Knowledge query smoke tests
+- `scripts/smoke_board.sh` Board smoke tests
+- `board_worker/` Distributed Hermes board worker
+- `board-worker.example.yaml` Example board worker config
 
 ## Run Instructions
 1. Build and start services:
@@ -102,6 +105,17 @@ MinIO:
 - `MINIO_ENDPOINT` (default `minio:9000`)
 - `MINIO_SECURE` (default `false`)
 
+Board:
+- `BOARD_ADMIN_TOKEN` (optional; enables admin bearer-token auth for `/api/board`)
+- `BOARD_WORKER_TOKENS_JSON` (optional JSON object mapping bearer tokens to worker identities/capabilities)
+- `BOARD_MAX_COMMENTS_PER_TASK` (default `12`)
+- `BOARD_MAX_CHILD_TASKS` (default `3`)
+- `BOARD_MAX_REASSIGNMENTS` (default `3`)
+- `BOARD_CLAIM_TTL_SECONDS` (default `120`)
+- `BOARD_AGENT_OFFLINE_AFTER_SECONDS` (default `90`)
+- `BOARD_MAX_TASK_BODY_CHARS` (default `20000`)
+- `BOARD_MAX_COMMENT_CHARS` (default `8000`)
+
 ## Migrations
 Run migrations manually (optional, same as `make init-db`):
 ```bash
@@ -111,6 +125,83 @@ docker compose run --rm api alembic upgrade head
 Rollback one migration:
 ```bash
 docker compose run --rm api alembic downgrade -1
+```
+
+## Board Auth
+Board auth stays open unless at least one of the following is configured:
+
+- `BOARD_ADMIN_TOKEN`
+- `BOARD_WORKER_TOKENS_JSON`
+
+Example:
+```bash
+export BOARD_ADMIN_TOKEN=board-admin-dev
+export BOARD_WORKER_TOKENS_JSON='{"rick-token":{"agent_name":"Rick","host_name":"titan","allowed_capabilities":["coordination"]}}'
+docker compose up -d --build api
+```
+
+Example admin request:
+```bash
+docker compose exec -T api curl -s http://127.0.0.1:8000/api/board/tasks \
+  -H "Authorization: Bearer ${BOARD_ADMIN_TOKEN}"
+```
+
+Worker tokens may only:
+- register and heartbeat themselves
+- claim tasks assigned to them or matching allowed capabilities
+- comment as themselves on tasks they currently own
+- complete, block, fail, release, start, and heartbeat tasks they currently own
+
+## Board Worker
+Example config file: [board-worker.example.yaml](./board-worker.example.yaml)
+
+Run the worker:
+```bash
+python -m board_worker.runner --config board-worker.example.yaml
+```
+
+The worker uses stdlib HTTP and config parsing. The config format is a simple YAML-like `key: value` file with inline list support for `capabilities`.
+
+## Ops Frontend
+The operator UI is served separately from this repository under `/ops/`.
+
+Board view:
+- `/ops/board`
+
+Console view:
+- `/ops/`
+
+The board UI talks to `/api/board/*` on the same origin. If board auth is enabled, enter a valid board bearer token in the board page session token field before using the board controls.
+
+## Smoke Tests
+Core task runner:
+```bash
+make smoke
+```
+
+Imports:
+```bash
+make smoke-imports
+```
+
+Knowledge promotion:
+```bash
+make smoke-knowledge
+```
+
+Knowledge query:
+```bash
+make smoke-query
+```
+
+Board:
+```bash
+make smoke-board
+```
+
+If board auth is enabled, provide a token for the board smoke:
+```bash
+BOARD_AUTH_TOKEN="${BOARD_ADMIN_TOKEN}" make smoke-board
 ```
 
 ## Verify Postgres Is In Use

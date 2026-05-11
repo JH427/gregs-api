@@ -7,6 +7,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl && rm -rf 
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
 COPY app /app/app
+COPY board_worker /app/board_worker
 COPY worker /app/worker
 COPY alembic /app/alembic
 COPY alembic.ini /app/alembic.ini

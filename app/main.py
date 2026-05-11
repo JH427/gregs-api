@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 
 from app.db import check_db, get_db, init_db
 from app.artifacts import router as artifacts_router
+from app.board import router as board_router
 from app.imports import delete_staged_import, detect_upload_mime, read_upload_limited, stage_import_bytes
 from app.knowledge.chunking import normalize_chunk_params
 from app.knowledge.domains import KnowledgeDomain
@@ -19,6 +20,13 @@ from app.logging_utils import configure_logging, get_logger, log_event, log_task
 from app.limits import (
     CHUNK_OVERLAP,
     CHUNK_SIZE,
+    BOARD_AGENT_OFFLINE_AFTER_SECONDS,
+    BOARD_CLAIM_TTL_SECONDS,
+    BOARD_MAX_CHILD_TASKS,
+    BOARD_MAX_COMMENT_CHARS,
+    BOARD_MAX_COMMENTS_PER_TASK,
+    BOARD_MAX_REASSIGNMENTS,
+    BOARD_MAX_TASK_BODY_CHARS,
     EMBEDDING_MODEL_DEFAULT,
     FETCH_DOMAIN_ALLOWLIST,
     KNOWLEDGE_QUERY_MAX_DOMAINS,
@@ -51,6 +59,7 @@ logger = get_logger("api")
 
 app = FastAPI()
 app.include_router(artifacts_router)
+app.include_router(board_router)
 
 
 class TaskCreateRequest(BaseModel):
@@ -656,4 +665,11 @@ def get_limits() -> Dict[str, Any]:
         "knowledge_promotion_embed_batch_size": KNOWLEDGE_PROMOTION_EMBED_BATCH_SIZE,
         "knowledge_promotion_upsert_batch_size": KNOWLEDGE_PROMOTION_UPSERT_BATCH_SIZE,
         "knowledge_promotion_model_init_timeout_seconds": KNOWLEDGE_PROMOTION_MODEL_INIT_TIMEOUT_SECONDS,
+        "board_max_comments_per_task": BOARD_MAX_COMMENTS_PER_TASK,
+        "board_max_child_tasks": BOARD_MAX_CHILD_TASKS,
+        "board_max_reassignments": BOARD_MAX_REASSIGNMENTS,
+        "board_claim_ttl_seconds": BOARD_CLAIM_TTL_SECONDS,
+        "board_agent_offline_after_seconds": BOARD_AGENT_OFFLINE_AFTER_SECONDS,
+        "board_max_task_body_chars": BOARD_MAX_TASK_BODY_CHARS,
+        "board_max_comment_chars": BOARD_MAX_COMMENT_CHARS,
     }

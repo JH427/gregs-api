@@ -1,4 +1,4 @@
-.PHONY: start init-db smoke smoke-imports smoke-knowledge smoke-query
+.PHONY: start init-db smoke smoke-imports smoke-knowledge smoke-query smoke-board
 
 start:
 	docker compose up -d --build
@@ -17,3 +17,6 @@ smoke-knowledge:
 
 smoke-query:
 	bash scripts/smoke_query.sh
+
+smoke-board:
+	bash scripts/smoke_board.sh

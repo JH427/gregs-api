@@ -101,3 +101,78 @@ class KnowledgeChunk(Base):
     qdrant_point_id = Column(String, nullable=False)
     text_artifact_id = Column(String, nullable=False)
     created_at = Column(DateTime(timezone=True), nullable=False, default=datetime.utcnow)
+
+
+class BoardAgent(Base):
+    __tablename__ = "board_agents"
+
+    id = Column(String, primary_key=True, index=True)
+    name = Column(String, nullable=False, index=True)
+    host = Column(String, nullable=False, index=True)
+    capabilities = Column(JSONB, nullable=False, default=list)
+    status = Column(String, nullable=False, default="offline", index=True)
+    last_heartbeat = Column(DateTime(timezone=True), nullable=True)
+    enabled = Column(Boolean, nullable=False, default=True)
+    metadata_json = Column(JSONB, nullable=False, default=dict)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=datetime.utcnow)
+    updated_at = Column(DateTime(timezone=True), nullable=False, default=datetime.utcnow)
+
+
+class BoardTask(Base):
+    __tablename__ = "board_tasks"
+
+    id = Column(String, primary_key=True, index=True)
+    title = Column(Text, nullable=False)
+    body = Column(Text, nullable=False)
+    status = Column(String, nullable=False, default="triage", index=True)
+    priority = Column(Integer, nullable=False, default=3, index=True)
+    assignee = Column(String, nullable=True, index=True)
+    requested_capability = Column(String, nullable=True, index=True)
+    created_by = Column(String, nullable=False, default="user")
+    claimed_by = Column(String, nullable=True, index=True)
+    claim_expires_at = Column(DateTime(timezone=True), nullable=True, index=True)
+    parent_task_id = Column(String, ForeignKey("board_tasks.id"), nullable=True, index=True)
+    workspace_type = Column(String, nullable=True, default="scratch")
+    workspace_ref = Column(String, nullable=True)
+    max_retries = Column(Integer, nullable=False, default=2)
+    retry_count = Column(Integer, nullable=False, default=0)
+    idempotency_key = Column(String, unique=True, nullable=True, index=True)
+    metadata_json = Column(JSONB, nullable=False, default=dict)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=datetime.utcnow)
+    updated_at = Column(DateTime(timezone=True), nullable=False, default=datetime.utcnow)
+    completed_at = Column(DateTime(timezone=True), nullable=True)
+
+
+class BoardComment(Base):
+    __tablename__ = "board_comments"
+
+    id = Column(String, primary_key=True, index=True)
+    task_id = Column(String, ForeignKey("board_tasks.id"), nullable=False, index=True)
+    author = Column(String, nullable=False, index=True)
+    comment_type = Column(String, nullable=False, default="info", index=True)
+    body = Column(Text, nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=datetime.utcnow)
+
+
+class BoardEvent(Base):
+    __tablename__ = "board_events"
+
+    id = Column(String, primary_key=True, index=True)
+    task_id = Column(String, ForeignKey("board_tasks.id"), nullable=True, index=True)
+    event_type = Column(String, nullable=False, index=True)
+    actor = Column(String, nullable=False, index=True)
+    payload_json = Column(JSONB, nullable=False, default=dict)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=datetime.utcnow)
+
+
+class BoardTaskArtifact(Base):
+    __tablename__ = "board_task_artifacts"
+
+    id = Column(String, primary_key=True, index=True)
+    task_id = Column(String, ForeignKey("board_tasks.id"), nullable=False, index=True)
+    artifact_id = Column(String, ForeignKey("artifacts.id"), nullable=True, index=True)
+    artifact_type = Column(String, nullable=True, index=True)
+    path = Column(String, nullable=True)
+    metadata_json = Column(JSONB, nullable=False, default=dict)
+    created_by = Column(String, nullable=True, index=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=datetime.utcnow)

@@ -102,6 +102,8 @@ services:
       MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
       MINIO_BUCKET: ${MINIO_BUCKET:-artifacts}
       MINIO_SECURE: ${MINIO_SECURE:-false}
+      BOARD_ADMIN_TOKEN: ${BOARD_ADMIN_TOKEN:-}
+      BOARD_WORKER_TOKENS_JSON: ${BOARD_WORKER_TOKENS_JSON:-}
     depends_on:
       - redis
       - postgres
