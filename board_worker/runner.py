@@ -11,7 +11,8 @@ from board_worker.workspace import ensure_workspace
 
 def _fetch_ready_tasks(client: BoardApiClient, config: BoardWorkerConfig) -> list[dict]:
     items: dict[str, dict] = {}
-    assigned = client.get("/tasks", {"status": "ready", "assignee": config.agent_name, "limit": 50})
+    agent_name = config.canonical_agent_name or config.agent_name
+    assigned = client.get("/tasks", {"status": "ready", "assignee": agent_name, "limit": 50})
     for task in assigned.get("tasks", []):
         items[task["id"]] = task
     for capability in config.capabilities:
@@ -22,38 +23,41 @@ def _fetch_ready_tasks(client: BoardApiClient, config: BoardWorkerConfig) -> lis
 
 
 def _post_result_comment(client: BoardApiClient, task_id: str, config: BoardWorkerConfig, execution: HermesExecutionResult) -> None:
+    agent_name = config.canonical_agent_name or config.agent_name
     comment_body = execution.result or execution.stdout.strip() or execution.stderr.strip() or execution.status
     client.post(
         f"/tasks/{task_id}/comments",
-        {"author": config.agent_name, "comment_type": "status", "body": comment_body[:8000]},
+        {"author": agent_name, "comment_type": "status", "body": comment_body[:8000]},
     )
 
 
 def _post_logs_artifact(client: BoardApiClient, task_id: str, config: BoardWorkerConfig, execution: HermesExecutionResult) -> None:
+    agent_name = config.canonical_agent_name or config.agent_name
     log_text = f"exit_code={execution.exit_code}\nruntime_seconds={execution.runtime_seconds:.3f}\n\nSTDOUT:\n{execution.stdout}\n\nSTDERR:\n{execution.stderr}\n"
     if len(log_text) < 512:
         return
     client.post(
         f"/tasks/{task_id}/artifacts",
         {
-            "created_by": config.agent_name,
             "artifact_type": "board_worker_log",
             "content_type": "text/plain",
             "data_base64": base64.b64encode(log_text.encode("utf-8")).decode("ascii"),
             "metadata": {"runtime_seconds": round(execution.runtime_seconds, 3), "exit_code": execution.exit_code},
+            "created_by": agent_name,
         },
     )
 
 
 def _execute_task(client: BoardApiClient, config: BoardWorkerConfig, task: dict) -> None:
     task_id = task["id"]
-    client.post(f"/tasks/{task_id}/claim", {"agent_name": config.agent_name, "claim_ttl_seconds": config.claim_ttl_seconds})
-    client.post(f"/tasks/{task_id}/start", {"agent_name": config.agent_name})
+    agent_name = config.canonical_agent_name or config.agent_name
+    client.post(f"/tasks/{task_id}/claim", {"agent_name": agent_name, "claim_ttl_seconds": config.claim_ttl_seconds})
+    client.post(f"/tasks/{task_id}/start", {"agent_name": agent_name})
     comments_payload = client.get(f"/tasks/{task_id}/comments")
-    prompt = build_task_prompt(config.agent_name, config.host_name, task, comments_payload.get("comments", []))
+    prompt = build_task_prompt(agent_name, config.host_name, task, comments_payload.get("comments", []))
     workspace = ensure_workspace(config, task_id)
     execution = run_hermes(config, prompt + f"\nWORKSPACE:\n{workspace}\n")
-    client.post(f"/tasks/{task_id}/heartbeat", {"agent_name": config.agent_name, "claim_ttl_seconds": config.claim_ttl_seconds})
+    client.post(f"/tasks/{task_id}/heartbeat", {"agent_name": agent_name, "claim_ttl_seconds": config.claim_ttl_seconds})
     _post_result_comment(client, task_id, config, execution)
     _post_logs_artifact(client, task_id, config, execution)
 
@@ -63,16 +67,16 @@ def _execute_task(client: BoardApiClient, config: BoardWorkerConfig, task: dict)
         "worker": "board_worker",
     }
     if execution.status == "done":
-        client.post(f"/tasks/{task_id}/complete", {"agent_name": config.agent_name, "metadata": metadata})
+        client.post(f"/tasks/{task_id}/complete", {"agent_name": agent_name, "metadata": metadata})
     elif execution.status == "blocked":
         client.post(
             f"/tasks/{task_id}/block",
-            {"agent_name": config.agent_name, "reason": execution.result[:500], "metadata": metadata},
+            {"agent_name": agent_name, "reason": execution.result[:500], "metadata": metadata},
         )
     else:
         client.post(
             f"/tasks/{task_id}/fail",
-            {"agent_name": config.agent_name, "error": execution.result[:500], "metadata": metadata},
+            {"agent_name": agent_name, "error": execution.result[:500], "metadata": metadata},
         )
 
 

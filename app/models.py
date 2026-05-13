@@ -128,6 +128,9 @@ class BoardTask(Base):
     priority = Column(Integer, nullable=False, default=3, index=True)
     assignee = Column(String, nullable=True, index=True)
     requested_capability = Column(String, nullable=True, index=True)
+    allowed_capabilities = Column(JSONB, nullable=False, default=list)
+    watchers = Column(JSONB, nullable=False, default=list)
+    contributors = Column(JSONB, nullable=False, default=list)
     created_by = Column(String, nullable=False, default="user")
     claimed_by = Column(String, nullable=True, index=True)
     claim_expires_at = Column(DateTime(timezone=True), nullable=True, index=True)
@@ -151,6 +154,7 @@ class BoardComment(Base):
     author = Column(String, nullable=False, index=True)
     comment_type = Column(String, nullable=False, default="info", index=True)
     body = Column(Text, nullable=False)
+    metadata_json = Column(JSONB, nullable=False, default=dict)
     created_at = Column(DateTime(timezone=True), nullable=False, default=datetime.utcnow)
 
 

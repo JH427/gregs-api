@@ -10,4 +10,4 @@ BOARD_TASK_STATUSES = {
     "done",
     "cancelled",
 }
-BOARD_COMMENT_TYPES = {"info", "status", "blocker", "system", "artifact", "escalation"}
+BOARD_COMMENT_TYPES = {"info", "status", "blocker", "system", "artifact", "escalation", "handoff"}

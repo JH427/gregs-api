@@ -228,15 +228,19 @@ Worker tokens encode:
 
 Workers may:
 - register and heartbeat themselves
+- patch their own stored agent profile
 - claim allowed `ready` tasks
 - act only as themselves
-- comment/artifact only on tasks they currently own
-- complete/block/fail/release/start/heartbeat only on tasks they currently own
+- comment and attach artifacts on any visible non-cancelled task
+- create child tasks under shared parent tasks they participate in
+- move their own unclaimed child tasks from `triage` or `todo` to `ready`
+- release their own stale claim
+- complete/block/fail/release/start/heartbeat only on tasks they currently claim
 
 Workers may not:
-- create tasks
-- patch arbitrary tasks
+- patch arbitrary root-task fields
 - cancel tasks
+- delete tasks
 - impersonate another worker
 
 ## Board Operational Rules
@@ -256,8 +260,10 @@ Important behavior:
 - claim is DB-atomic
 - claim only works for `ready` or expired claims
 - board uses row locking in Postgres
+- claim is an execution lock, not a collaboration lock
 - comment and child-task overflows can auto-block tasks
 - some internal counters are stored in metadata under `_system` and filtered out of API responses
+- failed permissioned mutations return diagnostic denial details and emit `board_authorization_denied` events
 
 ## Board Worker
 
@@ -267,11 +273,19 @@ Entry point:
 Run it with:
 
 ```bash
-python -m board_worker.runner --config board-worker.example.yaml
+export BOARD_WORKER_RICK_TOKEN=rick-token
+python -m board_worker.runner --config board-worker-rick.yaml
+```
+
+```bash
+export BOARD_WORKER_GREG_TOKEN=greg-token
+python -m board_worker.runner --config board-worker-greg.yaml
 ```
 
 Config example:
 - [board-worker.example.yaml](/home/adminuser/api/board-worker.example.yaml:1)
+- [board-worker-rick.yaml](/home/adminuser/api/board-worker-rick.yaml:1)
+- [board-worker-greg.yaml](/home/adminuser/api/board-worker-greg.yaml:1)
 
 Worker loop:
 1. register agent
@@ -284,6 +298,18 @@ Worker loop:
 8. complete / block / fail
 
 Hermes invocation is subprocess-based for now.
+
+Cron/non-interactive parity:
+- board workers send the same bearer token as interactive workers
+- optional Cloudflare Access headers are supported:
+  - `CF-Access-Client-Id`
+  - `CF-Access-Client-Secret`
+- worker config keys:
+  - `api_url`
+  - `api_token`
+  - `canonical_agent_name`
+  - `cf_access_client_id`
+  - `cf_access_client_secret`
 
 ## Current Frontend / Proxy Quirk
 
@@ -429,7 +455,10 @@ curl -s -X POST http://127.0.0.1:8000/api/board/tasks \
     "status":"ready",
     "priority":2,
     "created_by":"operator",
-    "requested_capability":"coordination"
+    "requested_capability":"coding",
+    "allowed_capabilities":["coding","git"],
+    "watchers":["Greg","Rick"],
+    "contributors":["Greg","Rick"]
   }'
 ```
 

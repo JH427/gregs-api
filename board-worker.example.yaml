@@ -1,7 +1,10 @@
 agent_name: Rick
+canonical_agent_name: Rick
 host_name: titan
 api_url: http://127.0.0.1:8000/api/board
 api_token: ${BOARD_WORKER_RICK_TOKEN}
+cf_access_client_id: ${CF_ACCESS_CLIENT_ID}
+cf_access_client_secret: ${CF_ACCESS_CLIENT_SECRET}
 poll_interval_seconds: 10
 heartbeat_interval_seconds: 20
 claim_ttl_seconds: 120

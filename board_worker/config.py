@@ -9,6 +9,9 @@ class BoardWorkerConfig:
     host_name: str
     api_url: str
     api_token: str
+    canonical_agent_name: str = ""
+    cf_access_client_id: str = ""
+    cf_access_client_secret: str = ""
     poll_interval_seconds: int = 10
     heartbeat_interval_seconds: int = 20
     claim_ttl_seconds: int = 120
@@ -68,6 +71,9 @@ def load_config(path: str) -> BoardWorkerConfig:
         host_name=str(values["host_name"]),
         api_url=api_url,
         api_token=str(values["api_token"]),
+        canonical_agent_name=str(values.get("canonical_agent_name") or values["agent_name"]),
+        cf_access_client_id=str(values.get("cf_access_client_id") or ""),
+        cf_access_client_secret=str(values.get("cf_access_client_secret") or ""),
         poll_interval_seconds=int(values.get("poll_interval_seconds") or 10),
         heartbeat_interval_seconds=int(values.get("heartbeat_interval_seconds") or 20),
         claim_ttl_seconds=int(values.get("claim_ttl_seconds") or 120),

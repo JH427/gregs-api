@@ -9,9 +9,9 @@ from sqlalchemy.orm import Session
 from app.artifacts import create_artifact_record
 from app.board.auth import (
     BoardActor,
+    is_admin_actor,
     is_worker_actor,
     require_admin_actor,
-    require_worker_self,
     worker_allows_capability,
 )
 from app.board.constants import BOARD_AGENT_STATUSES, BOARD_COMMENT_TYPES, BOARD_TASK_STATUSES
@@ -28,6 +28,7 @@ from app.board.schemas import (
     BoardCommentCreateRequest,
     BoardCommentRecord,
     BoardAgentHeartbeatRequest,
+    BoardAgentPatchRequest,
     BoardAgentRecord,
     BoardAgentRegisterRequest,
     BoardEventRecord,
@@ -36,6 +37,7 @@ from app.board.schemas import (
     BoardTaskClaimRequest,
     BoardTaskCompleteRequest,
     BoardTaskCreateRequest,
+    BoardTaskDeleteResponse,
     BoardTaskFailRequest,
     BoardTaskHeartbeatRequest,
     BoardTaskPatchRequest,
@@ -148,6 +150,9 @@ def serialize_board_task(task: BoardTask) -> BoardTaskRecord:
         priority=task.priority,
         assignee=task.assignee,
         requested_capability=task.requested_capability,
+        allowed_capabilities=list(task.allowed_capabilities or []),
+        watchers=list(task.watchers or []),
+        contributors=list(task.contributors or []),
         created_by=task.created_by,
         claimed_by=task.claimed_by,
         claim_expires_at=task.claim_expires_at,
@@ -171,6 +176,7 @@ def serialize_board_comment(comment: BoardComment) -> BoardCommentRecord:
         author=comment.author,
         comment_type=comment.comment_type,
         body=comment.body,
+        metadata=dict(comment.metadata_json or {}),
         created_at=comment.created_at,
     )
 
@@ -226,6 +232,130 @@ def _set_public_metadata(task: BoardTask, metadata: dict[str, Any]) -> None:
     task.metadata_json = merged
 
 
+def _normalize_identity_list(values: Optional[list[str]]) -> list[str]:
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for value in values or []:
+        item = " ".join(str(value).split()).strip()
+        if not item:
+            continue
+        lowered = item.lower()
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        normalized.append(item)
+    return normalized
+
+
+def _normalize_identity_value(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    item = " ".join(str(value).split()).strip()
+    return item or None
+
+
+def _identity_matches(lhs: Optional[str], rhs: Optional[str]) -> bool:
+    return bool(lhs and rhs and lhs.lower() == rhs.lower())
+
+
+def _identity_in_list(name: Optional[str], values: Optional[list[str]]) -> bool:
+    if not name:
+        return False
+    lowered = name.lower()
+    return any(str(value).strip().lower() == lowered for value in values or [])
+
+
+def _actor_capability_set(actor: BoardActor) -> set[str]:
+    return {value.lower() for value in actor.allowed_capabilities}
+
+
+def _actor_has_capability(actor: BoardActor, capability: str) -> bool:
+    return capability.lower() in _actor_capability_set(actor)
+
+
+def _task_allowed_capability_set(task: BoardTask) -> set[str]:
+    return {str(value).strip().lower() for value in task.allowed_capabilities or [] if str(value).strip()}
+
+
+def _task_requested_capability_matches(actor: BoardActor, task: BoardTask) -> bool:
+    requested = _normalize_identity_value(task.requested_capability)
+    if not requested:
+        return False
+    return requested.lower() in _actor_capability_set(actor)
+
+
+def _task_allowed_capabilities_match(actor: BoardActor, task: BoardTask) -> bool:
+    allowed = _task_allowed_capability_set(task)
+    if not allowed:
+        return True
+    return bool(allowed & _actor_capability_set(actor))
+
+
+def _is_visible_worker_task(actor: BoardActor, task: BoardTask) -> bool:
+    return any(
+        [
+            _identity_matches(task.assignee, actor.name),
+            _identity_matches(task.claimed_by, actor.name),
+            _identity_matches(task.created_by, actor.name),
+            _identity_in_list(actor.name, task.watchers),
+            _identity_in_list(actor.name, task.contributors),
+            _task_requested_capability_matches(actor, task),
+            _task_allowed_capabilities_match(actor, task),
+        ]
+    )
+
+
+def _denial_detail(
+    actor: BoardActor,
+    task: Optional[BoardTask],
+    required_permission: str,
+    denial_reason: str,
+) -> dict[str, Any]:
+    return {
+        "actor": actor.name,
+        "token_type": actor.token_type,
+        "task_id": task.id if task else None,
+        "status": task.status if task else None,
+        "assignee": task.assignee if task else None,
+        "claimed_by": task.claimed_by if task else None,
+        "claim_expires_at": task.claim_expires_at.isoformat() if task and task.claim_expires_at else None,
+        "required_permission": required_permission,
+        "denial_reason": denial_reason,
+    }
+
+
+def _deny(
+    db: Session,
+    actor: BoardActor,
+    required_permission: str,
+    denial_reason: str,
+    task: Optional[BoardTask] = None,
+    status_code: int = 403,
+) -> None:
+    payload = _denial_detail(actor, task, required_permission, denial_reason)
+    create_board_event(
+        db,
+        event_type="board_authorization_denied",
+        actor=actor.name,
+        task_id=task.id if task else None,
+        payload=payload,
+    )
+    raise HTTPException(status_code=status_code, detail=payload)
+
+
+def _ensure_worker_self(
+    db: Session,
+    actor: BoardActor,
+    agent_name: str,
+    required_permission: str,
+    task: Optional[BoardTask] = None,
+) -> None:
+    if is_admin_actor(actor):
+        return
+    if not _identity_matches(actor.name, agent_name):
+        _deny(db, actor, required_permission, "worker token may only act as itself", task)
+
+
 def _claim_expired(task: BoardTask) -> bool:
     return bool(task.claim_expires_at and task.claim_expires_at <= _utcnow())
 
@@ -272,6 +402,74 @@ def _child_task_count(db: Session, parent_task_id: str) -> int:
     return db.query(BoardTask).filter(BoardTask.parent_task_id == parent_task_id).count()
 
 
+def can_view_task(actor: BoardActor, task: BoardTask) -> bool:
+    if is_admin_actor(actor):
+        return True
+    if task.status == "cancelled":
+        return _identity_matches(task.assignee, actor.name) or _identity_in_list(actor.name, task.watchers) or _identity_in_list(actor.name, task.contributors)
+    return True
+
+
+def can_comment_task(actor: BoardActor, task: BoardTask) -> bool:
+    if task.status == "cancelled":
+        return False
+    return can_view_task(actor, task)
+
+
+def can_create_child_task(actor: BoardActor, parent_task: BoardTask) -> bool:
+    if is_admin_actor(actor):
+        return True
+    if parent_task.status == "cancelled":
+        return False
+    return any(
+        [
+            _identity_matches(parent_task.assignee, actor.name),
+            _identity_matches(parent_task.claimed_by, actor.name),
+            _identity_in_list(actor.name, parent_task.watchers),
+            _identity_in_list(actor.name, parent_task.contributors),
+            _identity_matches(parent_task.created_by, actor.name),
+        ]
+    )
+
+
+def can_claim_task(actor: BoardActor, task: BoardTask) -> bool:
+    if is_admin_actor(actor):
+        return True
+    if task.assignee and not _identity_matches(task.assignee, actor.name):
+        return False
+    if not _task_allowed_capabilities_match(actor, task):
+        return False
+    if task.requested_capability and not _task_requested_capability_matches(actor, task):
+        return False
+    if task.status == "ready":
+        return True
+    return _claim_expired(task)
+
+
+def can_start_task(actor: BoardActor, task: BoardTask) -> bool:
+    if is_admin_actor(actor):
+        return True
+    return _identity_matches(task.claimed_by, actor.name) and not _claim_expired(task)
+
+
+def can_complete_task(actor: BoardActor, task: BoardTask) -> bool:
+    return can_start_task(actor, task)
+
+
+def can_transition_task(actor: BoardActor, task: BoardTask, from_status: str, to_status: str) -> bool:
+    if is_admin_actor(actor):
+        return True
+    if task.status != from_status:
+        return False
+    if to_status == "ready":
+        return (
+            _identity_matches(task.created_by, actor.name)
+            and task.claimed_by is None
+            and from_status in {"triage", "todo"}
+        )
+    return False
+
+
 def _auto_block_task(db: Session, task: BoardTask, actor: BoardActor, reason: str, payload: Optional[dict[str, Any]] = None) -> None:
     if task.status != "blocked":
         task.status = "blocked"
@@ -289,15 +487,15 @@ def _auto_block_task(db: Session, task: BoardTask, actor: BoardActor, reason: st
 
 def register_board_agent(db: Session, payload: BoardAgentRegisterRequest, actor: BoardActor) -> BoardAgentRecord:
     if is_worker_actor(actor):
-        require_worker_self(actor, payload.name)
+        _ensure_worker_self(db, actor, payload.name, "register_agent")
         if actor.host != payload.host:
-            raise HTTPException(status_code=403, detail="worker token host mismatch")
+            _deny(db, actor, "register_agent", "worker token host mismatch")
     status = validate_board_agent_status(payload.status)
     capabilities = _normalize_capabilities(payload.capabilities)
     if is_worker_actor(actor):
         allowed = {value.lower() for value in actor.allowed_capabilities}
         if not set(value.lower() for value in capabilities).issubset(allowed):
-            raise HTTPException(status_code=403, detail="worker token capabilities mismatch")
+            _deny(db, actor, "register_agent", "worker token capabilities mismatch")
     now = _utcnow()
 
     agent = (
@@ -342,9 +540,9 @@ def register_board_agent(db: Session, payload: BoardAgentRegisterRequest, actor:
 def heartbeat_board_agent(db: Session, payload: BoardAgentHeartbeatRequest, actor: BoardActor) -> BoardAgentRecord:
     agent = _agent_or_404(db, payload.agent_id)
     if is_worker_actor(actor):
-        require_worker_self(actor, agent.name)
+        _ensure_worker_self(db, actor, agent.name, "heartbeat_agent")
         if actor.host != agent.host:
-            raise HTTPException(status_code=403, detail="worker token host mismatch")
+            _deny(db, actor, "heartbeat_agent", "worker token host mismatch")
     now = _utcnow()
     agent.last_heartbeat = now
     agent.updated_at = now
@@ -363,21 +561,66 @@ def heartbeat_board_agent(db: Session, payload: BoardAgentHeartbeatRequest, acto
     return serialize_board_agent(agent)
 
 
+def patch_board_agent(db: Session, agent_id: str, payload: BoardAgentPatchRequest, actor: BoardActor) -> BoardAgentRecord:
+    agent = _agent_or_404(db, agent_id)
+    updates = payload.model_dump(exclude_unset=True)
+    if not updates:
+        return serialize_board_agent(agent)
+    if is_worker_actor(actor):
+        _ensure_worker_self(db, actor, agent.name, "patch_agent")
+        if actor.host != agent.host:
+            _deny(db, actor, "patch_agent", "worker token host mismatch")
+        if "capabilities" in updates:
+            normalized_caps = _normalize_capabilities(updates["capabilities"] or [])
+            if not set(value.lower() for value in normalized_caps).issubset(_actor_capability_set(actor)):
+                _deny(db, actor, "patch_agent", "worker token capabilities mismatch")
+            agent.capabilities = normalized_caps
+        if "enabled" in updates:
+            _deny(db, actor, "patch_agent", "worker token may not toggle enabled")
+    else:
+        if "capabilities" in updates:
+            agent.capabilities = _normalize_capabilities(updates["capabilities"] or [])
+    if "status" in updates and updates["status"] is not None:
+        agent.status = validate_board_agent_status(updates["status"])
+    if "enabled" in updates and is_admin_actor(actor):
+        agent.enabled = bool(updates["enabled"])
+    if "metadata" in updates and updates["metadata"] is not None:
+        agent.metadata_json = updates["metadata"]
+    agent.updated_at = _utcnow()
+    db.commit()
+    create_board_event(
+        db,
+        event_type="board_agent_updated",
+        actor=actor.name,
+        payload={"agent_id": agent.id, "name": agent.name, "host": agent.host, "status": agent.status},
+    )
+    db.refresh(agent)
+    return serialize_board_agent(agent)
+
+
 def list_board_agents(db: Session) -> list[BoardAgentRecord]:
     agents = db.query(BoardAgent).order_by(BoardAgent.updated_at.desc(), BoardAgent.created_at.desc()).all()
     return [serialize_board_agent(agent) for agent in agents]
 
 
 def create_board_task(db: Session, payload: BoardTaskCreateRequest, actor: BoardActor) -> BoardTaskRecord:
-    require_admin_actor(actor)
+    worker_create = is_worker_actor(actor)
+    if not worker_create:
+        require_admin_actor(actor)
     if payload.idempotency_key:
         existing = db.query(BoardTask).filter(BoardTask.idempotency_key == payload.idempotency_key).first()
         if existing:
             return serialize_board_task(existing)
 
+    requested_capability = _normalize_identity_value(payload.requested_capability)
+    assignee = _normalize_identity_value(payload.assignee)
+    allowed_capabilities = _normalize_capabilities(payload.allowed_capabilities)
+    watchers = _normalize_identity_list(payload.watchers)
+    contributors = _normalize_identity_list(payload.contributors)
     status = validate_board_task_status(payload.status)
     now = _utcnow()
     parent_task_id: Optional[str] = payload.parent_task_id
+    parent_task: Optional[BoardTask] = None
     if parent_task_id:
         parent_task = _task_or_404(db, parent_task_id)
         child_count = _child_task_count(db, parent_task_id)
@@ -390,6 +633,36 @@ def create_board_task(db: Session, payload: BoardTaskCreateRequest, actor: Board
                 {"child_count": child_count, "limit": BOARD_MAX_CHILD_TASKS},
             )
             raise HTTPException(status_code=409, detail="board max child tasks exceeded")
+    elif worker_create:
+        _deny(db, actor, "create_child_task", "worker token may only create child tasks")
+
+    if worker_create:
+        assert parent_task is not None
+        if not can_create_child_task(actor, parent_task):
+            _deny(db, actor, "create_child_task", "actor may not create child tasks on this parent", parent_task)
+        if (
+            not _actor_has_capability(actor, "board_manage_limited")
+            and requested_capability
+            and not worker_allows_capability(actor, requested_capability)
+        ):
+            _deny(db, actor, "create_child_task", "worker token cannot request that capability", parent_task)
+        if (
+            not _actor_has_capability(actor, "board_manage_limited")
+            and allowed_capabilities
+            and not set(value.lower() for value in allowed_capabilities).issubset(_actor_capability_set(actor))
+        ):
+            _deny(db, actor, "create_child_task", "worker token cannot grant unowned allowed capabilities", parent_task)
+        if not watchers:
+            watchers = _normalize_identity_list(list(parent_task.watchers or []))
+        if not contributors:
+            contributors = _normalize_identity_list(list(parent_task.contributors or []))
+        if actor.name not in watchers:
+            watchers.append(actor.name)
+        if parent_task.assignee and parent_task.assignee not in watchers:
+            watchers.append(parent_task.assignee)
+        status = "ready" if (assignee or requested_capability) else "triage"
+    elif status == "triage" and (assignee or requested_capability):
+        status = "ready"
 
     task = BoardTask(
         id=str(uuid.uuid4()),
@@ -397,9 +670,12 @@ def create_board_task(db: Session, payload: BoardTaskCreateRequest, actor: Board
         body=_normalize_text_field_with_limit(payload.body, "body", BOARD_MAX_TASK_BODY_CHARS),
         status=status,
         priority=payload.priority,
-        assignee=payload.assignee,
-        requested_capability=payload.requested_capability,
-        created_by=payload.created_by,
+        assignee=assignee,
+        requested_capability=requested_capability,
+        allowed_capabilities=allowed_capabilities,
+        watchers=watchers,
+        contributors=contributors,
+        created_by=actor.name if worker_create else payload.created_by,
         claimed_by=None,
         claim_expires_at=None,
         parent_task_id=parent_task_id,
@@ -420,18 +696,31 @@ def create_board_task(db: Session, payload: BoardTaskCreateRequest, actor: Board
         event_type="board_task_created",
         actor=actor.name,
         task_id=task.id,
-        payload={"status": task.status, "assignee": task.assignee, "requested_capability": task.requested_capability},
+        payload={
+            "status": task.status,
+            "assignee": task.assignee,
+            "requested_capability": task.requested_capability,
+            "allowed_capabilities": list(task.allowed_capabilities or []),
+            "watchers": list(task.watchers or []),
+            "contributors": list(task.contributors or []),
+            "parent_task_id": task.parent_task_id,
+            "created_by": task.created_by,
+        },
     )
     db.refresh(task)
     return serialize_board_task(task)
 
 
-def get_board_task(db: Session, task_id: str) -> BoardTaskRecord:
-    return serialize_board_task(_task_or_404(db, task_id))
+def get_board_task(db: Session, task_id: str, actor: BoardActor) -> BoardTaskRecord:
+    task = _task_or_404(db, task_id)
+    if not can_view_task(actor, task):
+        _deny(db, actor, "view_task", "task is not visible to actor", task)
+    return serialize_board_task(task)
 
 
 def list_board_tasks(
     db: Session,
+    actor: BoardActor,
     limit: int,
     offset: int,
     status: Optional[str] = None,
@@ -452,22 +741,27 @@ def list_board_tasks(
     if parent_task_id:
         query = query.filter(BoardTask.parent_task_id == parent_task_id)
 
-    total = query.count()
-    tasks = (
-        query.order_by(BoardTask.priority.asc(), BoardTask.created_at.desc())
-        .offset(offset)
-        .limit(limit)
-        .all()
-    )
-    return total, [serialize_board_task(task) for task in tasks]
+    tasks = query.order_by(BoardTask.priority.asc(), BoardTask.created_at.desc()).all()
+    visible_tasks = [task for task in tasks if can_view_task(actor, task)]
+    total = len(visible_tasks)
+    window = visible_tasks[offset : offset + limit]
+    return total, [serialize_board_task(task) for task in window]
 
 
 def patch_board_task(db: Session, task_id: str, payload: BoardTaskPatchRequest, actor: BoardActor) -> BoardTaskRecord:
-    require_admin_actor(actor)
     task = _task_or_404(db, task_id)
+    if not can_view_task(actor, task):
+        _deny(db, actor, "patch_task", "task is not visible to actor", task)
     updates = payload.model_dump(exclude_unset=True)
     if not updates:
         return serialize_board_task(task)
+    if is_worker_actor(actor):
+        allowed_status_only = set(updates.keys()).issubset({"status", "metadata"})
+        if not allowed_status_only:
+            _deny(db, actor, "transition_task", "worker token may only transition status or update metadata", task)
+        next_status = updates.get("status")
+        if next_status is None or not can_transition_task(actor, task, task.status, next_status):
+            _deny(db, actor, "transition_task", "worker token may not perform that status transition", task)
 
     if "status" in updates:
         task.status = validate_board_task_status(updates["status"])
@@ -483,7 +777,7 @@ def patch_board_task(db: Session, task_id: str, payload: BoardTaskPatchRequest, 
         task.priority = updates["priority"]
     if "assignee" in updates:
         previous_assignee = task.assignee
-        task.assignee = updates["assignee"]
+        task.assignee = _normalize_identity_value(updates["assignee"])
         if previous_assignee and previous_assignee != task.assignee:
             system = _system_metadata(task.metadata_json)
             reassignments = int(system.get("reassignment_count", 0)) + 1
@@ -512,7 +806,13 @@ def patch_board_task(db: Session, task_id: str, payload: BoardTaskPatchRequest, 
                 db.refresh(task)
                 return serialize_board_task(task)
     if "requested_capability" in updates:
-        task.requested_capability = updates["requested_capability"]
+        task.requested_capability = _normalize_identity_value(updates["requested_capability"])
+    if "allowed_capabilities" in updates:
+        task.allowed_capabilities = _normalize_capabilities(updates["allowed_capabilities"] or [])
+    if "watchers" in updates:
+        task.watchers = _normalize_identity_list(updates["watchers"] or [])
+    if "contributors" in updates:
+        task.contributors = _normalize_identity_list(updates["contributors"] or [])
     if "parent_task_id" in updates:
         parent_task_id = updates["parent_task_id"]
         if parent_task_id:
@@ -528,6 +828,8 @@ def patch_board_task(db: Session, task_id: str, payload: BoardTaskPatchRequest, 
         task.max_retries = updates["max_retries"]
     if "metadata" in updates:
         _set_public_metadata(task, updates["metadata"])
+    if task.status == "triage" and (task.assignee or task.requested_capability):
+        task.status = "ready"
 
     task.updated_at = _utcnow()
     db.commit()
@@ -543,16 +845,15 @@ def patch_board_task(db: Session, task_id: str, payload: BoardTaskPatchRequest, 
 
 
 def claim_board_task(db: Session, task_id: str, payload: BoardTaskClaimRequest, actor: BoardActor) -> BoardTaskRecord:
-    require_worker_self(actor, payload.agent_name)
+    _ensure_worker_self(db, actor, payload.agent_name, "claim_task")
     task = _locked_task_or_404(db, task_id)
     claim_expired = _claim_expired(task)
+    if not can_view_task(actor, task):
+        _deny(db, actor, "claim_task", "task is not visible to actor", task)
     if task.status != "ready" and not claim_expired:
-        raise HTTPException(status_code=409, detail="board task is not claimable")
-    if is_worker_actor(actor):
-        if task.assignee and task.assignee != actor.name:
-            raise HTTPException(status_code=403, detail="worker token may not claim tasks assigned to another agent")
-        if not worker_allows_capability(actor, task.requested_capability):
-            raise HTTPException(status_code=403, detail="worker token capability mismatch")
+        _deny(db, actor, "claim_task", "board task is not claimable", task, status_code=409)
+    if not can_claim_task(actor, task):
+        _deny(db, actor, "claim_task", "actor may not claim this task", task)
 
     ttl_seconds = min(payload.claim_ttl_seconds, BOARD_CLAIM_TTL_SECONDS)
     _set_claim(task, payload.agent_name, ttl_seconds)
@@ -575,11 +876,12 @@ def claim_board_task(db: Session, task_id: str, payload: BoardTaskClaimRequest, 
 
 
 def heartbeat_board_task(db: Session, task_id: str, payload: BoardTaskHeartbeatRequest, actor: BoardActor) -> BoardTaskRecord:
-    require_worker_self(actor, payload.agent_name)
+    _ensure_worker_self(db, actor, payload.agent_name, "heartbeat_task")
     task = _locked_task_or_404(db, task_id)
-    _require_live_claim_owner(task, payload.agent_name)
+    if not can_start_task(actor, task):
+        _deny(db, actor, "heartbeat_task", "actor does not hold a live claim", task, status_code=409)
     if task.status not in {"claimed", "running"}:
-        raise HTTPException(status_code=409, detail="board task is not active")
+        _deny(db, actor, "heartbeat_task", "board task is not active", task, status_code=409)
 
     ttl_seconds = min(payload.claim_ttl_seconds, BOARD_CLAIM_TTL_SECONDS)
     _set_claim(task, payload.agent_name, ttl_seconds)
@@ -597,9 +899,10 @@ def heartbeat_board_task(db: Session, task_id: str, payload: BoardTaskHeartbeatR
 
 
 def release_board_task(db: Session, task_id: str, payload: BoardTaskReleaseRequest, actor: BoardActor) -> BoardTaskRecord:
-    require_worker_self(actor, payload.agent_name)
+    _ensure_worker_self(db, actor, payload.agent_name, "release_task")
     task = _locked_task_or_404(db, task_id)
-    _require_live_claim_owner(task, payload.agent_name)
+    if not _identity_matches(task.claimed_by, actor.name):
+        _deny(db, actor, "release_task", "actor does not own this claim", task, status_code=409)
     release_status = validate_board_task_status(payload.status)
     if release_status in {"claimed", "running", "done", "failed", "cancelled"}:
         raise HTTPException(status_code=400, detail="invalid release status")
@@ -620,11 +923,12 @@ def release_board_task(db: Session, task_id: str, payload: BoardTaskReleaseReque
 
 
 def start_board_task(db: Session, task_id: str, payload: BoardTaskStartRequest, actor: BoardActor) -> BoardTaskRecord:
-    require_worker_self(actor, payload.agent_name)
+    _ensure_worker_self(db, actor, payload.agent_name, "start_task")
     task = _locked_task_or_404(db, task_id)
-    _require_live_claim_owner(task, payload.agent_name)
+    if not can_start_task(actor, task):
+        _deny(db, actor, "start_task", "actor does not hold a live claim", task, status_code=409)
     if task.status != "claimed":
-        raise HTTPException(status_code=409, detail="board task must be claimed before start")
+        _deny(db, actor, "start_task", "board task must be claimed before start", task, status_code=409)
 
     _transition_claimed_task(task, "running")
     db.commit()
@@ -640,11 +944,12 @@ def start_board_task(db: Session, task_id: str, payload: BoardTaskStartRequest, 
 
 
 def complete_board_task(db: Session, task_id: str, payload: BoardTaskCompleteRequest, actor: BoardActor) -> BoardTaskRecord:
-    require_worker_self(actor, payload.agent_name)
+    _ensure_worker_self(db, actor, payload.agent_name, "complete_task")
     task = _locked_task_or_404(db, task_id)
-    _require_live_claim_owner(task, payload.agent_name)
+    if not can_complete_task(actor, task):
+        _deny(db, actor, "complete_task", "actor does not hold a live claim", task, status_code=409)
     if task.status not in {"claimed", "running"}:
-        raise HTTPException(status_code=409, detail="board task is not active")
+        _deny(db, actor, "complete_task", "board task is not active", task, status_code=409)
 
     task.status = "done"
     task.completed_at = _utcnow()
@@ -665,11 +970,12 @@ def complete_board_task(db: Session, task_id: str, payload: BoardTaskCompleteReq
 
 
 def block_board_task(db: Session, task_id: str, payload: BoardTaskBlockRequest, actor: BoardActor) -> BoardTaskRecord:
-    require_worker_self(actor, payload.agent_name)
+    _ensure_worker_self(db, actor, payload.agent_name, "block_task")
     task = _locked_task_or_404(db, task_id)
-    _require_live_claim_owner(task, payload.agent_name)
+    if not can_complete_task(actor, task):
+        _deny(db, actor, "block_task", "actor does not hold a live claim", task, status_code=409)
     if task.status not in {"claimed", "running"}:
-        raise HTTPException(status_code=409, detail="board task is not active")
+        _deny(db, actor, "block_task", "board task is not active", task, status_code=409)
 
     task.status = "blocked"
     task.updated_at = _utcnow()
@@ -689,11 +995,12 @@ def block_board_task(db: Session, task_id: str, payload: BoardTaskBlockRequest, 
 
 
 def fail_board_task(db: Session, task_id: str, payload: BoardTaskFailRequest, actor: BoardActor) -> BoardTaskRecord:
-    require_worker_self(actor, payload.agent_name)
+    _ensure_worker_self(db, actor, payload.agent_name, "fail_task")
     task = _locked_task_or_404(db, task_id)
-    _require_live_claim_owner(task, payload.agent_name)
+    if not can_complete_task(actor, task):
+        _deny(db, actor, "fail_task", "actor does not hold a live claim", task, status_code=409)
     if task.status not in {"claimed", "running"}:
-        raise HTTPException(status_code=409, detail="board task is not active")
+        _deny(db, actor, "fail_task", "board task is not active", task, status_code=409)
 
     task.status = "failed"
     task.updated_at = _utcnow()
@@ -713,8 +1020,10 @@ def fail_board_task(db: Session, task_id: str, payload: BoardTaskFailRequest, ac
 
 
 def cancel_board_task(db: Session, task_id: str, payload: BoardTaskCancelRequest, actor: BoardActor) -> BoardTaskRecord:
-    require_admin_actor(actor)
     task = _locked_task_or_404(db, task_id)
+    if is_worker_actor(actor):
+        _deny(db, actor, "cancel_task", "worker token may not cancel tasks", task)
+    require_admin_actor(actor)
     task.status = "cancelled"
     task.updated_at = _utcnow()
     _clear_claim(task, clear_owner=True)
@@ -732,8 +1041,53 @@ def cancel_board_task(db: Session, task_id: str, payload: BoardTaskCancelRequest
     return serialize_board_task(task)
 
 
-def list_board_comments(db: Session, task_id: str) -> list[BoardCommentRecord]:
+def _collect_board_task_subtree_ids(db: Session, root_task_id: str) -> list[str]:
+    ordered: list[str] = []
+    stack = [root_task_id]
+    while stack:
+        current = stack.pop()
+        ordered.append(current)
+        children = (
+            db.query(BoardTask.id)
+            .filter(BoardTask.parent_task_id == current)
+            .order_by(BoardTask.created_at.desc())
+            .all()
+        )
+        stack.extend(child_id for (child_id,) in children)
+    return ordered
+
+
+def delete_board_task(db: Session, task_id: str, actor: BoardActor) -> BoardTaskDeleteResponse:
+    require_admin_actor(actor)
     _task_or_404(db, task_id)
+    task_ids = _collect_board_task_subtree_ids(db, task_id)
+
+    task_events = db.query(BoardEvent).filter(BoardEvent.task_id.in_(task_ids)).all()
+    for event in task_events:
+        payload = dict(event.payload_json or {})
+        payload["deleted_task_id"] = event.task_id
+        event.payload_json = payload
+        event.task_id = None
+    db.flush()
+
+    db.query(BoardComment).filter(BoardComment.task_id.in_(task_ids)).delete(synchronize_session=False)
+    db.query(BoardTaskArtifact).filter(BoardTaskArtifact.task_id.in_(task_ids)).delete(synchronize_session=False)
+    db.query(BoardTask).filter(BoardTask.id.in_(task_ids)).delete(synchronize_session=False)
+    db.commit()
+
+    create_board_event(
+        db,
+        event_type="board_task_deleted",
+        actor=actor.name,
+        payload={"root_task_id": task_id, "deleted_task_ids": task_ids, "deleted_count": len(task_ids)},
+    )
+    return BoardTaskDeleteResponse(deleted_count=len(task_ids), deleted_task_ids=task_ids)
+
+
+def list_board_comments(db: Session, task_id: str, actor: BoardActor) -> list[BoardCommentRecord]:
+    task = _task_or_404(db, task_id)
+    if not can_view_task(actor, task):
+        _deny(db, actor, "view_task_comments", "task is not visible to actor", task)
     comments = (
         db.query(BoardComment)
         .filter(BoardComment.task_id == task_id)
@@ -751,8 +1105,9 @@ def create_board_comment(
 ) -> BoardCommentRecord:
     task = _task_or_404(db, task_id)
     if is_worker_actor(actor):
-        require_worker_self(actor, payload.author)
-        _require_claim_owner(task, actor.name)
+        _ensure_worker_self(db, actor, payload.author, "comment_task", task)
+    if not can_comment_task(actor, task):
+        _deny(db, actor, "comment_task", "actor may not comment on this task", task)
     comment_count = _comment_count_for_task(db, task_id)
     if comment_count >= BOARD_MAX_COMMENTS_PER_TASK:
         task = _task_or_404(db, task_id)
@@ -771,6 +1126,12 @@ def create_board_comment(
         author=_normalize_text_field(payload.author, "author"),
         comment_type=validate_board_comment_type(payload.comment_type),
         body=_normalize_text_field_with_limit(payload.body, "body", BOARD_MAX_COMMENT_CHARS),
+        metadata_json={
+            "token_identity": actor.token_id or actor.name,
+            "token_type": actor.token_type,
+            "claimed_by_at_comment": task.claimed_by,
+            "task_status_at_comment": task.status,
+        },
         created_at=_utcnow(),
     )
     db.add(comment)
@@ -791,17 +1152,24 @@ def create_board_comment(
     return serialize_board_comment(comment)
 
 
-def list_board_events(db: Session, task_id: Optional[str] = None, limit: int = 100) -> list[BoardEventRecord]:
+def list_board_events(db: Session, actor: BoardActor, task_id: Optional[str] = None, limit: int = 100) -> list[BoardEventRecord]:
     query = db.query(BoardEvent)
     if task_id:
-        _task_or_404(db, task_id)
+        task = _task_or_404(db, task_id)
+        if not can_view_task(actor, task):
+            _deny(db, actor, "view_task_events", "task is not visible to actor", task)
         query = query.filter(BoardEvent.task_id == task_id)
     events = query.order_by(BoardEvent.created_at.desc()).limit(limit).all()
+    if is_worker_actor(actor) and not task_id:
+        visible_ids = {task.id for task in db.query(BoardTask).all() if can_view_task(actor, task)}
+        events = [event for event in events if event.task_id is None or event.task_id in visible_ids]
     return [serialize_board_event(event) for event in events]
 
 
-def list_board_task_artifacts(db: Session, task_id: str) -> list[BoardTaskArtifactRecord]:
-    _task_or_404(db, task_id)
+def list_board_task_artifacts(db: Session, task_id: str, actor: BoardActor) -> list[BoardTaskArtifactRecord]:
+    task = _task_or_404(db, task_id)
+    if not can_view_task(actor, task):
+        _deny(db, actor, "view_task_artifacts", "task is not visible to actor", task)
     items = (
         db.query(BoardTaskArtifact)
         .filter(BoardTaskArtifact.task_id == task_id)
@@ -819,8 +1187,9 @@ def create_board_task_artifact(
 ) -> BoardTaskArtifactRecord:
     task = _task_or_404(db, task_id)
     if is_worker_actor(actor):
-        require_worker_self(actor, payload.created_by)
-        _require_claim_owner(task, actor.name)
+        _ensure_worker_self(db, actor, payload.created_by, "attach_artifact", task)
+    if not can_comment_task(actor, task):
+        _deny(db, actor, "attach_artifact", "actor may not attach artifacts to this task", task)
     artifact_id = payload.artifact_id
     path = payload.path
     artifact_type = payload.artifact_type

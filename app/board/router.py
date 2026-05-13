@@ -7,6 +7,7 @@ from app.board.auth import BoardActor, get_board_actor
 from app.board.schemas import (
     BoardAgentHeartbeatRequest,
     BoardAgentListResponse,
+    BoardAgentPatchRequest,
     BoardAgentRecord,
     BoardAgentRegisterRequest,
     BoardCommentCreateRequest,
@@ -18,6 +19,7 @@ from app.board.schemas import (
     BoardTaskClaimRequest,
     BoardTaskCompleteRequest,
     BoardTaskCreateRequest,
+    BoardTaskDeleteResponse,
     BoardTaskFailRequest,
     BoardTaskHeartbeatRequest,
     BoardTaskListResponse,
@@ -37,6 +39,7 @@ from app.board.service import (
     create_board_comment,
     create_board_task,
     create_board_task_artifact,
+    delete_board_task,
     fail_board_task,
     get_board_task,
     heartbeat_board_agent,
@@ -47,6 +50,7 @@ from app.board.service import (
     list_board_task_artifacts,
     list_board_tasks,
     patch_board_task,
+    patch_board_agent,
     release_board_task,
     register_board_agent,
     start_board_task,
@@ -73,6 +77,16 @@ def heartbeat_agent(
     actor: BoardActor = Depends(get_board_actor),
 ) -> BoardAgentRecord:
     return heartbeat_board_agent(db, payload, actor)
+
+
+@router.patch("/agents/{agent_id}", response_model=BoardAgentRecord)
+def update_agent(
+    agent_id: str,
+    payload: BoardAgentPatchRequest,
+    db: Session = Depends(get_db),
+    actor: BoardActor = Depends(get_board_actor),
+) -> BoardAgentRecord:
+    return patch_board_agent(db, agent_id, payload, actor)
 
 
 @router.get("/agents", response_model=BoardAgentListResponse)
@@ -106,6 +120,7 @@ def get_tasks(
 ) -> BoardTaskListResponse:
     total, tasks = list_board_tasks(
         db,
+        actor=actor,
         limit=limit,
         offset=offset,
         status=status_filter,
@@ -123,7 +138,7 @@ def get_task(
     db: Session = Depends(get_db),
     actor: BoardActor = Depends(get_board_actor),
 ) -> BoardTaskRecord:
-    return get_board_task(db, task_id)
+    return get_board_task(db, task_id, actor)
 
 
 @router.patch("/tasks/{task_id}", response_model=BoardTaskRecord)
@@ -134,6 +149,15 @@ def update_task(
     actor: BoardActor = Depends(get_board_actor),
 ) -> BoardTaskRecord:
     return patch_board_task(db, task_id, payload, actor)
+
+
+@router.delete("/tasks/{task_id}", response_model=BoardTaskDeleteResponse)
+def remove_task(
+    task_id: str,
+    db: Session = Depends(get_db),
+    actor: BoardActor = Depends(get_board_actor),
+) -> BoardTaskDeleteResponse:
+    return delete_board_task(db, task_id, actor)
 
 
 @router.post("/tasks/{task_id}/claim", response_model=BoardTaskRecord)
@@ -222,7 +246,7 @@ def get_task_comments(
     db: Session = Depends(get_db),
     actor: BoardActor = Depends(get_board_actor),
 ) -> BoardCommentListResponse:
-    return BoardCommentListResponse(comments=list_board_comments(db, task_id))
+    return BoardCommentListResponse(comments=list_board_comments(db, task_id, actor))
 
 
 @router.post("/tasks/{task_id}/comments", response_model=BoardCommentRecord, status_code=status.HTTP_201_CREATED)
@@ -241,7 +265,7 @@ def get_task_artifacts(
     db: Session = Depends(get_db),
     actor: BoardActor = Depends(get_board_actor),
 ) -> BoardTaskArtifactListResponse:
-    return BoardTaskArtifactListResponse(artifacts=list_board_task_artifacts(db, task_id))
+    return BoardTaskArtifactListResponse(artifacts=list_board_task_artifacts(db, task_id, actor))
 
 
 @router.post("/tasks/{task_id}/artifacts", response_model=BoardTaskArtifactRecord, status_code=status.HTTP_201_CREATED)
@@ -261,4 +285,4 @@ def get_events(
     db: Session = Depends(get_db),
     actor: BoardActor = Depends(get_board_actor),
 ) -> BoardEventListResponse:
-    return BoardEventListResponse(events=list_board_events(db, task_id=task_id, limit=limit))
+    return BoardEventListResponse(events=list_board_events(db, actor, task_id=task_id, limit=limit))

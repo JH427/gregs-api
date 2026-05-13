@@ -32,6 +32,13 @@ class BoardAgentHeartbeatRequest(BaseModel):
     metadata: Optional[dict[str, Any]] = None
 
 
+class BoardAgentPatchRequest(BaseModel):
+    capabilities: Optional[list[str]] = None
+    status: Optional[str] = None
+    enabled: Optional[bool] = None
+    metadata: Optional[dict[str, Any]] = None
+
+
 class BoardAgentListResponse(BaseModel):
     agents: list[BoardAgentRecord]
 
@@ -44,6 +51,9 @@ class BoardTaskRecord(BaseModel):
     priority: int
     assignee: Optional[str] = None
     requested_capability: Optional[str] = None
+    allowed_capabilities: list[str] = Field(default_factory=list)
+    watchers: list[str] = Field(default_factory=list)
+    contributors: list[str] = Field(default_factory=list)
     created_by: str
     claimed_by: Optional[str] = None
     claim_expires_at: Optional[datetime] = None
@@ -66,6 +76,9 @@ class BoardTaskCreateRequest(BaseModel):
     priority: int = Field(default=3, ge=0)
     assignee: Optional[str] = None
     requested_capability: Optional[str] = None
+    allowed_capabilities: list[str] = Field(default_factory=list)
+    watchers: list[str] = Field(default_factory=list)
+    contributors: list[str] = Field(default_factory=list)
     created_by: str = "user"
     parent_task_id: Optional[str] = None
     workspace_type: Optional[str] = "scratch"
@@ -82,6 +95,9 @@ class BoardTaskPatchRequest(BaseModel):
     priority: Optional[int] = Field(default=None, ge=0)
     assignee: Optional[str] = None
     requested_capability: Optional[str] = None
+    allowed_capabilities: Optional[list[str]] = None
+    watchers: Optional[list[str]] = None
+    contributors: Optional[list[str]] = None
     parent_task_id: Optional[str] = None
     workspace_type: Optional[str] = None
     workspace_ref: Optional[str] = None
@@ -94,6 +110,11 @@ class BoardTaskListResponse(BaseModel):
     limit: int
     offset: int
     tasks: list[BoardTaskRecord]
+
+
+class BoardTaskDeleteResponse(BaseModel):
+    deleted_count: int
+    deleted_task_ids: list[str]
 
 
 class BoardTaskClaimRequest(BaseModel):
@@ -154,6 +175,7 @@ class BoardCommentRecord(BaseModel):
     author: str
     comment_type: str
     body: str
+    metadata: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime
 
 

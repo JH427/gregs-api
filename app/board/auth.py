@@ -13,6 +13,7 @@ class BoardActor:
     host: Optional[str] = None
     allowed_capabilities: list[str] = field(default_factory=list)
     token_id: Optional[str] = None
+    token_type: str = "admin"
 
 
 def _normalize_capabilities(values: list[Any]) -> list[str]:
@@ -116,4 +117,5 @@ def get_board_actor(authorization: Optional[str] = Header(default=None)) -> Boar
         host=host_name,
         allowed_capabilities=_normalize_capabilities(worker_config.get("allowed_capabilities") or []),
         token_id=agent_name,
+        token_type="worker",
     )

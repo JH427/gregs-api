@@ -138,7 +138,7 @@ Board auth stays open unless at least one of the following is configured:
 Example:
 ```bash
 export BOARD_ADMIN_TOKEN=board-admin-dev
-export BOARD_WORKER_TOKENS_JSON='{"rick-token":{"agent_name":"Rick","host_name":"titan","allowed_capabilities":["coordination"]}}'
+export BOARD_WORKER_TOKENS_JSON='{"rick-token":{"agent_name":"Rick","host_name":"titan","allowed_capabilities":["coding","git","infra","wiki","pr_review","merge","board_manage_limited"]},"greg-token":{"agent_name":"Greg","host_name":"backoffice","allowed_capabilities":["research","analysis","synthesis","wiki","pr_create","board_manage_limited"]}}'
 docker compose up -d --build api
 ```
 
@@ -150,19 +150,52 @@ docker compose exec -T api curl -s http://127.0.0.1:8000/api/board/tasks \
 
 Worker tokens may only:
 - register and heartbeat themselves
-- claim tasks assigned to them or matching allowed capabilities
-- comment as themselves on tasks they currently own
-- complete, block, fail, release, start, and heartbeat tasks they currently own
+- patch their own agent profile
+- claim ready tasks assigned to them or matching their capabilities
+- comment as themselves on any visible non-cancelled task
+- attach artifacts on any visible non-cancelled task
+- create child tasks on shared/visible parent tasks they participate in
+- move their own unclaimed child tasks from `triage` or `todo` to `ready`
+- release their own stale claim
+- complete, block, fail, release, start, and heartbeat tasks they currently claim
+
+Worker tokens may not:
+- delete tasks
+- cancel root tasks
+- impersonate another agent
+- force-complete another agent's claim
 
 ## Board Worker
 Example config file: [board-worker.example.yaml](./board-worker.example.yaml)
 
+Concrete local configs:
+- `board-worker-rick.yaml`
+- `board-worker-greg.yaml`
+
 Run the worker:
 ```bash
-python -m board_worker.runner --config board-worker.example.yaml
+export BOARD_WORKER_RICK_TOKEN=rick-token
+python -m board_worker.runner --config board-worker-rick.yaml
+```
+
+```bash
+export BOARD_WORKER_GREG_TOKEN=greg-token
+python -m board_worker.runner --config board-worker-greg.yaml
 ```
 
 The worker uses stdlib HTTP and config parsing. The config format is a simple YAML-like `key: value` file with inline list support for `capabilities`.
+
+Additional worker config keys for cron/non-interactive parity:
+- `canonical_agent_name`
+- `cf_access_client_id`
+- `cf_access_client_secret`
+
+Recommended cron environment:
+- `BOARD_API_URL`
+- `BOARD_WORKER_TOKEN`
+- `CANONICAL_AGENT_NAME`
+- `CF_ACCESS_CLIENT_ID`
+- `CF_ACCESS_CLIENT_SECRET`
 
 ## Ops Frontend
 The operator UI is served separately from this repository under `/ops/`.

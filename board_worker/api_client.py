@@ -10,10 +10,15 @@ class BoardApiClient:
         self.config = config
 
     def _headers(self) -> dict[str, str]:
-        return {
+        headers = {
             "Authorization": f"Bearer {self.config.api_token}",
             "Content-Type": "application/json",
         }
+        if self.config.cf_access_client_id:
+            headers["CF-Access-Client-Id"] = self.config.cf_access_client_id
+        if self.config.cf_access_client_secret:
+            headers["CF-Access-Client-Secret"] = self.config.cf_access_client_secret
+        return headers
 
     def _request(self, method: str, path: str, payload: Optional[dict[str, Any]] = None) -> Any:
         url = f"{self.config.api_url}{path}"
@@ -47,7 +52,7 @@ class BoardApiClient:
         return self.post(
             "/agents/register",
             {
-                "name": self.config.agent_name,
+                "name": self.config.canonical_agent_name or self.config.agent_name,
                 "host": self.config.host_name,
                 "capabilities": self.config.capabilities,
                 "status": "idle",
